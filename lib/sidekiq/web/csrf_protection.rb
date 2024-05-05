@@ -56,7 +56,7 @@ module Sidekiq
       end
 
       def logger(env)
-        @logger ||= (env["rack.logger"] || ::Logger.new(env["rack.errors"]))
+        @logger ||= env["rack.logger"] || ::Logger.new(env["rack.errors"])
       end
 
       def deny(env)
@@ -115,7 +115,7 @@ module Sidekiq
         sess = session(env)
         localtoken = sess[:csrf]
 
-        # Checks that Rack::Session::Cookie actualy contains the csrf toekn
+        # Checks that Rack::Session::Cookie actually contains the csrf token
         return false if localtoken.nil?
 
         # Rotate the session token after every use

@@ -266,7 +266,7 @@ describe "API" do
 
     it "enumerates jobs in descending score order" do
       # We need to enqueue more than 50 items, which is the page size when retrieving
-      # from Redis to ensure everything is sorted: the pages and the items withing them.
+      # from Redis to ensure everything is sorted: the pages and the items within them.
       51.times { ApiJob.perform_in(100, 1, "foo") }
 
       set = Sidekiq::ScheduledSet.new.to_a
@@ -659,6 +659,27 @@ describe "API" do
       end
 
       assert_equal ["5678", "1234"], w.map { |_, tid, _| tid }
+    end
+
+    it "can find a work by jid" do
+      w = Sidekiq::Workers.new
+      hn = Socket.gethostname
+      key = "#{hn}:#{$$}"
+      @cfg.redis do |conn|
+        conn.sadd("processes", [key])
+      end
+
+      s = "#{key}:work"
+      jid = "abcdef"
+      data = Sidekiq.dump_json({"payload" => {"args" => ["foo"], "jid" => jid}, "queue" => "default", "run_at" => Time.now.to_i})
+      @cfg.redis do |c|
+        c.hset(s, "1234", data)
+      end
+
+      assert_nil w.find_work_by_jid("nonexistent")
+
+      work = w.find_work_by_jid(jid)
+      assert_equal ["foo"], work.job.args
     end
 
     it "can reschedule jobs" do

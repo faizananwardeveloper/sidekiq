@@ -2,7 +2,27 @@
 
 [Sidekiq Changes](https://github.com/sidekiq/sidekiq/blob/main/Changes.md) | [Sidekiq Pro Changes](https://github.com/sidekiq/sidekiq/blob/main/Pro-Changes.md) | [Sidekiq Enterprise Changes](https://github.com/sidekiq/sidekiq/blob/main/Ent-Changes.md)
 
-HEAD
+7.2.4
+----------
+
+- Fix XSS in metrics filtering introduced in 7.2.0, CVE-2024-32887
+  Thanks to @UmerAdeemCheema for the security report.
+
+7.2.3
+----------
+
+- [Support Dragonfly.io](https://www.mikeperham.com/2024/02/01/supporting-dragonfly/) as an alternative Redis implementation
+- Fix error unpacking some compressed error backtraces [#6241]
+- Fix potential heartbeat data leak [#6227]
+- Add ability to find a currently running work by jid [#6212, fatkodima]
+
+7.2.2
+----------
+
+- Add `Process.warmup` call in Ruby 3.3+
+- Batch jobs now skip transactional push [#6160]
+
+7.2.1
 ----------
 
 - Add `Sidekiq::Work` type which replaces the raw Hash as the third parameter in
