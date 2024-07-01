@@ -95,7 +95,7 @@ describe Sidekiq::RedisConnection do
       it "uses the default network_timeout if none specified" do
         pool = Sidekiq::RedisConnection.create
         redis = pool.checkout
-        assert_equal 1.0, client_for(redis).read_timeout
+        assert_equal 3.0, client_for(redis).read_timeout
       end
     end
 
@@ -185,6 +185,26 @@ describe Sidekiq::RedisConnection do
           assert_includes(options.inspect, "ssl_params")
         end
         refute_includes(output, "ssl_params")
+      end
+    end
+
+    it "symbolizes redis options keys" do
+      options = {
+        "name" => "mymaster",
+        "sentinels" => [
+          {"host" => "host1", "port" => 26379, "password" => "secret"},
+          {"host" => "host2", "port" => 26379, "password" => "secret"},
+          {"host" => "host3", "port" => 26379, "password" => "secret"}
+        ]
+      }
+
+      pool = Sidekiq::RedisConnection.create(options)
+      config = config_for(pool.checkout)
+
+      config.sentinels.each.with_index do |sentinel_config, idx|
+        assert_equal options["sentinels"][idx]["host"], sentinel_config.host
+        assert_equal options["sentinels"][idx]["port"], sentinel_config.port
+        assert_equal options["sentinels"][idx]["password"], sentinel_config.password
       end
     end
   end
