@@ -1,7 +1,9 @@
 # elements like %{queue} are variables and should not be translated
 lt:
+  LanguageName: Lietuvių
   Actions: Veiksmai
   AddToQueue: Pridėti į eilę
+  AddAllToQueue: Pridėti viską į eilę
   AreYouSure: Ar jūs įsitikinę?
   AreYouSureDeleteJob: Ar tikrai norite pašalinti šį darbą?
   AreYouSureDeleteQueue: Ar tikrai norite pašalinti šią eilę %{queue}?

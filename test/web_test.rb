@@ -3,6 +3,7 @@
 require_relative "helper"
 require "sidekiq/web"
 require "rack/test"
+require "rack/session"
 
 class WebJob
   include Sidekiq::Job
@@ -20,12 +21,9 @@ end
 
 describe Sidekiq::Web do
   include Rack::Test::Methods
-  def session_secret
-    "v3rys3cr31v3rys3cr31v3rys3cr31v3rys3cr31v3rys3cr31v3rys3cr31mike!"
-  end
 
   def app
-    @app ||= Sidekiq::Web.new
+    @app ||= Rack::Lint.new(Sidekiq::Web.new)
   end
 
   def job_params(job, score)
@@ -34,13 +32,18 @@ describe Sidekiq::Web do
 
   before do
     @config = reset!
-    app.middlewares.clear
+    env "HTTP_SEC_FETCH_SITE", "same-origin"
+
+    Sidekiq::Web.configure do |c|
+      c.middlewares.clear
+      c.use Rack::Session::Cookie, secrets: "35c5108120cb479eecb4e947e423cad6da6f38327cf0ebb323e30816d74fa01f"
+    end
   end
 
   it "passes on unexpected methods" do
     patch "/"
     assert_equal 404, last_response.status
-    assert_equal "pass", last_response.headers[Sidekiq::Web::X_CASCADE]
+    assert_equal "pass", last_response.headers["x-cascade"]
   end
 
   it "can show text with any locales" do
@@ -53,10 +56,10 @@ describe Sidekiq::Web do
     rackenv = {"HTTP_ACCEPT_LANGUAGE" => "en-us"}
     get "/", {}, rackenv
     assert_match(/Dashboard/, last_response.body)
-    rackenv = {"HTTP_ACCEPT_LANGUAGE" => "zh-cn"}
+    rackenv = {"HTTP_ACCEPT_LANGUAGE" => "zh-CN"}
     get "/", {}, rackenv
     assert_match(/信息板/, last_response.body)
-    rackenv = {"HTTP_ACCEPT_LANGUAGE" => "zh-tw"}
+    rackenv = {"HTTP_ACCEPT_LANGUAGE" => "zh-TW"}
     get "/", {}, rackenv
     assert_match(/資訊主頁/, last_response.body)
     rackenv = {"HTTP_ACCEPT_LANGUAGE" => "nb"}
@@ -68,9 +71,10 @@ describe Sidekiq::Web do
     get "/", {}
     policies = last_response.headers["Content-Security-Policy"].split("; ")
     assert_includes(policies, "connect-src 'self' https: http: wss: ws:")
-    assert_includes(policies, "style-src 'self' https: http: 'unsafe-inline'")
-    assert_includes(policies, "script-src 'self' https: http:")
+    assert_includes(policies, "style-src 'self' 'nonce-#{last_request.env[:csp_nonce]}'")
+    assert_includes(policies, "script-src 'self' 'nonce-#{last_request.env[:csp_nonce]}'")
     assert_includes(policies, "object-src 'none'")
+    assert_operator(last_request.env[:csp_nonce].length, :>=, 16)
   end
 
   it "provides a cheap HEAD response" do
@@ -78,26 +82,58 @@ describe Sidekiq::Web do
     assert_equal 1, Sidekiq::Queue.new.size
 
     head "/", {}
-    assert_equal "1", last_response.body.to_s
+    assert_equal "", last_response.body.to_s
   end
 
   describe "busy" do
-    it "can display workers" do
+    before do
+      @jid = SecureRandom.hex(12)
       @config.redis do |conn|
         conn.incr("busy")
         conn.sadd("processes", ["foo:1234"])
-        conn.hset("foo:1234", "info", Sidekiq.dump_json("hostname" => "foo", "started_at" => Time.now.to_f, "queues" => [], "concurrency" => 10), "at", Time.now.to_f, "busy", 4)
+        conn.hset("foo:1234", "info", Sidekiq.dump_json("hostname" => "foo", "started_at" => Time.now.to_f, "capsules" => {}, "concurrency" => 10), "at", Time.now.to_f, "busy", 4)
         identity = "foo:1234:work"
-        hash = {queue: "critical", payload: Sidekiq.dump_json({"class" => WebJob.name, "args" => [1, "abc"]}), run_at: Time.now.to_i}
+        hash = {queue: "critical", payload: Sidekiq.dump_json({"class" => WebJob.name, "args" => [1, "abc"], "jid" => @jid, "tags" => %w[foobar_100 <eviltag/>]}), run_at: Time.now.to_i}
         conn.hset(identity, 1001, Sidekiq.dump_json(hash))
       end
+      add_iteration_state(@jid, cursor: {"offset" => 500}, executions: 7)
+    end
+
+    it "renders without error when requesting a page beyond available workers" do
+      get "/busy?page=99"
+      assert_equal 200, last_response.status
+    end
+
+    it "renders only jobs" do
+      get "/busy?only=jobs"
+      assert_equal 200, last_response.status
+      assert_match(/WebJob/, last_response.body)
+    end
+
+    it "renders only processes" do
+      get "/busy?only=processes"
+      assert_equal 200, last_response.status
+      refute_match(/WebJob/, last_response.body)
+    end
+
+    it "can display workers" do
       assert_equal ["1001"], Sidekiq::WorkSet.new.map { |pid, tid, data| tid }
 
       get "/busy"
       assert_equal 200, last_response.status
-      assert_match(/status-active/, last_response.body)
+      assert_includes last_response.body, "Busy (4/0) | Sidekiq</title>"
       assert_match(/critical/, last_response.body)
       assert_match(/WebJob/, last_response.body)
+      assert_match(/#{@jid}/, last_response.body)
+      assert_match(/jobtag-foobar_100/, last_response.body)
+      assert_match(/jobtag-&lt;eviltag\/&gt;/, last_response.body)
+      assert_match(/offset/, last_response.body)
+      assert_match(/exec=7/, last_response.body)
+    end
+
+    it "does not crash on a negative count parameter" do
+      get "/busy?count=-1"
+      assert_equal 200, last_response.status
     end
 
     it "can quiet all processes" do
@@ -148,9 +184,12 @@ describe Sidekiq::Web do
   end
 
   it "can display queues" do
-    assert Sidekiq::Client.push("queue" => :foo, "class" => WebJob, "args" => [1, 3])
+    Time.stub(:now, Time.now) do
+      assert Sidekiq::Client.push("queue" => :foo, "class" => WebJob, "args" => [1, 3])
 
-    get "/queues"
+      get "/queues"
+    end
+
     assert_equal 200, last_response.status
     assert_match(/foo/, last_response.body)
     refute_match(/HardJob/, last_response.body)
@@ -158,8 +197,8 @@ describe Sidekiq::Web do
     refute_match(/datetime/, last_response.body)
     Sidekiq::Queue.new("foo").clear
 
-    Time.stub(:now, Time.now - 65) do
-      assert Sidekiq::Client.push("queue" => :foo, "class" => WebJob, "args" => [1, 3])
+    ::Process.stub(:clock_gettime, ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond) - 65000) do
+      assert Sidekiq::Client.push("queue" => :foo, "class" => WebJob, "args" => [1, 3], "enqueued_at" => (Time.now.to_f * 1000).floor)
     end
 
     get "/queues"
@@ -211,7 +250,7 @@ describe Sidekiq::Web do
     assert_equal 302, last_response.status
 
     @config.redis do |conn|
-      refute conn.smembers("queues").include?("foo")
+      refute_includes conn.smembers("queues"), "foo"
       refute(conn.exists("queue:foo") > 0)
     end
   end
@@ -302,7 +341,7 @@ describe Sidekiq::Web do
     assert_equal 302, last_response.status
 
     @config.redis do |conn|
-      refute conn.lrange("queue:foo", 0, -1).include?("{\"foo\":\"bar\"}")
+      refute_includes conn.lrange("queue:foo", 0, -1), "{\"foo\":\"bar\"}"
     end
   end
 
@@ -320,14 +359,30 @@ describe Sidekiq::Web do
     assert_match(/HardJob/, last_response.body)
   end
 
+  it "displays iteration state on retry detail page" do
+    jid = SecureRandom.hex(12)
+    params = add_retry(jid)
+    add_iteration_state(jid, cursor: {"id" => 42}, executions: 3, runtime: 12.345)
+
+    get "/retries/#{job_params(*params)}"
+    assert_equal 200, last_response.status
+    assert_match(/Iteration/, last_response.body)
+    assert_match(/cursor=/, last_response.body)
+    assert_match(/exec=3/, last_response.body)
+  end
+
   it "displays custom job info" do
-    Sidekiq::Web.custom_job_info_rows << LogDisplayer.new
+    Sidekiq::Web.configure do |c|
+      c.custom_job_info_rows << LogDisplayer.new
+    end
     params = add_retry
     get "/retries/#{job_params(*params)}"
     assert_equal 200, last_response.status
     assert_match(/https:\/\/example.com\/logs\//, last_response.body)
   ensure
-    Sidekiq::Web.custom_job_info_rows.clear
+    Sidekiq::Web.configure do |c|
+      c.custom_job_info_rows.clear
+    end
   end
 
   it "can display a single retry" do
@@ -349,19 +404,13 @@ describe Sidekiq::Web do
     3.times { add_retry }
     add_retry("MIKE1234")
 
-    get "/filter/retries"
-    assert_equal 302, last_response.status
-
-    post "/filter/retries"
-    assert_equal 302, last_response.status
-
-    post "/filter/retries", substr: "nope"
+    get "/retries", substr: "nope"
     refute_match(/RuntimeError/, last_response.body)
 
-    get "/filter/retries", substr: "nope"
+    get "/retries", substr: "nope"
     refute_match(/RuntimeError/, last_response.body)
 
-    post "/filter/retries", substr: "MIKE1234"
+    get "/retries", substr: "MIKE1234"
     assert_match(/MIKE1234/, last_response.body)
   end
 
@@ -467,19 +516,13 @@ describe Sidekiq::Web do
     3.times { add_scheduled }
     add_scheduled("MIKE1234")
 
-    get "/filter/scheduled"
-    assert_equal 302, last_response.status
-
-    post "/filter/scheduled"
-    assert_equal 302, last_response.status
-
-    get "/filter/scheduled", substr: "nope"
+    get "/scheduled", substr: "nope"
     refute_match(/RuntimeError/, last_response.body)
 
-    post "/filter/scheduled", substr: "nope"
+    get "/scheduled", substr: "nope"
     refute_match(/RuntimeError/, last_response.body)
 
-    post "/filter/scheduled", substr: "MIKE1234"
+    get "/scheduled", substr: "MIKE1234"
     assert_match(/MIKE1234/, last_response.body)
   end
 
@@ -533,6 +576,40 @@ describe Sidekiq::Web do
     end
   end
 
+  it "can delete all scheduled jobs" do
+    3.times { add_scheduled }
+
+    assert_equal 3, Sidekiq::ScheduledSet.new.size
+    post "/scheduled/all/delete"
+    assert_equal 0, Sidekiq::ScheduledSet.new.size
+    assert_equal 302, last_response.status
+    assert_equal "http://example.org/scheduled", last_response.headers["Location"]
+  end
+
+  it "can add all scheduled jobs to queue" do
+    msg1 = add_scheduled.first
+    msg2 = add_scheduled.first
+    msg3 = add_scheduled.first
+
+    assert_equal 3, Sidekiq::ScheduledSet.new.size
+    assert_equal 0, Sidekiq::Queue.new("default").size
+
+    post "/scheduled/all/add_to_queue"
+    assert_equal 302, last_response.status
+    assert_equal "http://example.org/scheduled", last_response.headers["Location"]
+
+    # All scheduled jobs should be moved to the default queue
+    assert_equal 0, Sidekiq::ScheduledSet.new.size
+    assert_equal 3, Sidekiq::Queue.new("default").size
+
+    # Verify jobs are in the queue
+    get "/queues/default"
+    assert_equal 200, last_response.status
+    assert_match(/#{msg1["args"][2]}/, last_response.body)
+    assert_match(/#{msg2["args"][2]}/, last_response.body)
+    assert_match(/#{msg3["args"][2]}/, last_response.body)
+  end
+
   it "can retry all retries" do
     msg = add_retry.first
     add_retry
@@ -554,17 +631,17 @@ describe Sidekiq::Web do
     assert_equal 200, last_response.status
     assert_match(/FailJob/, last_response.body)
 
-    assert last_response.body.include?("fail message: &lt;a&gt;hello&lt;&#x2F;a&gt;")
-    assert !last_response.body.include?("fail message: <a>hello</a>")
+    assert_includes last_response.body, "fail message: &lt;a&gt;hello&lt;/a&gt;"
+    refute_includes last_response.body, "fail message: <a>hello</a>"
 
-    assert last_response.body.include?("args\">&quot;&lt;a&gt;hello&lt;&#x2F;a&gt;&quot;<")
-    assert !last_response.body.include?("args\"><a>hello</a><")
+    assert_includes last_response.body, "args\">&quot;&lt;a&gt;hello&lt;/a&gt;&quot;<"
+    refute_includes last_response.body, "args\"><a>hello</a><"
 
     # on /workers page
     @config.redis do |conn|
       pro = "foo:1234"
       conn.sadd("processes", [pro])
-      conn.hset(pro, "info", Sidekiq.dump_json("started_at" => Time.now.to_f, "labels" => ["frumduz"], "queues" => [], "concurrency" => 10), "busy", 1, "beat", Time.now.to_f)
+      conn.hset(pro, "info", Sidekiq.dump_json("started_at" => Time.now.to_f, "labels" => ["frumduz"], "capsules" => {}, "concurrency" => 10), "busy", 1, "beat", Time.now.to_f)
       identity = "#{pro}:work"
       hash = {queue: "critical", payload: Sidekiq.dump_json({"class" => "FailJob", "args" => ["<a>hello</a>"]}), run_at: Time.now.to_i}
       conn.hset(identity, 100001, Sidekiq.dump_json(hash))
@@ -575,8 +652,8 @@ describe Sidekiq::Web do
     assert_equal 200, last_response.status
     assert_match(/FailJob/, last_response.body)
     assert_match(/frumduz/, last_response.body)
-    assert last_response.body.include?("&lt;a&gt;hello&lt;&#x2F;a&gt;")
-    assert !last_response.body.include?("<a>hello</a>")
+    assert_includes last_response.body, "&lt;a&gt;hello&lt;/a&gt;"
+    refute_includes last_response.body, "<a>hello</a>"
 
     # on /queues page
     params = add_xss_retry # sorry, don't know how to easily make this show up on queues page otherwise.
@@ -585,8 +662,8 @@ describe Sidekiq::Web do
 
     get "/queues/foo"
     assert_equal 200, last_response.status
-    assert last_response.body.include?("&lt;a&gt;hello&lt;&#x2F;a&gt;")
-    assert !last_response.body.include?("<a>hello</a>")
+    assert_includes last_response.body, "&lt;a&gt;hello&lt;/a&gt;"
+    refute_includes last_response.body, "<a>hello</a>"
   end
 
   it "can show user defined tab" do
@@ -601,25 +678,43 @@ describe Sidekiq::Web do
   it "can display home" do
     get "/"
     assert_equal 200, last_response.status
+    assert_match(%r{<title>(\[\w+\] )?Sidekiq</title>}, last_response.body)
+  end
+
+  it "includes counts in the page title" do
+    Sidekiq::Client.push("queue" => :foo, "class" => WebJob, "args" => [1, 3])
+
+    {
+      "/queues" => "Queues (1)",
+      "/retries" => "Retries (0)",
+      "/scheduled" => "Scheduled Jobs (0)",
+      "/morgue" => "Dead Jobs (0)"
+    }.each do |path, title|
+      get path
+      assert_includes last_response.body, "#{title} | Sidekiq</title>"
+    end
   end
 
   it "can change the locale" do
     session_data = {"rack.session" => {}}
     headers = {"HTTP_REFERER" => "http://example.org/path", "HTTP_BASE_URL" => "http://example.org/"}
 
+    post "/change_locale", {"locale" => "none"}, session_data.merge(headers)
+    assert_nil last_request.env["rack.session"][:locale]
+    assert_equal 302, last_response.status
+    assert_equal "http://example.org/path", last_response.location
+
     post "/change_locale", {"locale" => "es"}, session_data.merge(headers)
-
     assert_equal "es", last_request.env["rack.session"][:locale]
-
     assert_equal 302, last_response.status
     assert_equal "http://example.org/path", last_response.location
   end
 
   describe "custom locales" do
     before do
-      Sidekiq::Web.settings.locales << File.join(File.dirname(__FILE__), "fixtures")
+      Sidekiq::Web.locales << File.join(File.dirname(__FILE__), "fixtures")
       Sidekiq::Web.tabs["Custom Tab"] = "/custom"
-      Sidekiq::WebApplication.get("/custom") do
+      Sidekiq::Web::Application.get("/custom") do
         clear_caches # ugly hack since I can't figure out how to access WebHelpers outside of this context
         t("translated_text")
       end
@@ -627,7 +722,7 @@ describe Sidekiq::Web do
 
     after do
       Sidekiq::Web.tabs.delete "Custom Tab"
-      Sidekiq::Web.settings.locales.pop
+      Sidekiq::Web.locales.pop
     end
 
     it "can show user defined tab with custom locales" do
@@ -758,19 +853,13 @@ describe Sidekiq::Web do
       3.times { add_dead }
       add_dead("MIKE1234")
 
-      get "/filter/dead"
-      assert_equal 302, last_response.status
-
-      post "/filter/dead"
-      assert_equal 302, last_response.status
-
-      post "/filter/dead", substr: "nope"
+      get "/morgue", substr: "nope"
       refute_match(/RuntimeError/, last_response.body)
 
-      get "/filter/dead", substr: "nope"
+      get "/morgue", substr: "nope"
       refute_match(/RuntimeError/, last_response.body)
 
-      post "/filter/dead", substr: "MIKE1234"
+      get "/morgue", substr: "MIKE1234"
       assert_match(/MIKE1234/, last_response.body)
     end
 
@@ -815,6 +904,7 @@ describe Sidekiq::Web do
     msg = {"class" => "HardJob",
            "args" => ["bob", 1, Time.now.to_f],
            "jid" => jid,
+           "queue" => "default",
            "tags" => ["tag1", "tag2"]}
     @config.redis do |conn|
       conn.zadd("schedule", score, Sidekiq.dump_json(msg))
@@ -846,7 +936,7 @@ describe Sidekiq::Web do
            "error_message" => "Some fake message",
            "error_class" => "RuntimeError",
            "retry_count" => 0,
-           "failed_at" => Time.now.utc,
+           "failed_at" => Time.now.to_f,
            "jid" => jid}
     score = Time.now.to_f
     @config.redis do |conn|
@@ -864,6 +954,12 @@ describe Sidekiq::Web do
     [job, score]
   end
 
+  def add_iteration_state(jid, cursor: {"id" => 42}, executions: 3, runtime: 12.345)
+    @config.redis do |conn|
+      conn.hset("it-#{jid}", "ex", executions, "c", Sidekiq.dump_json(cursor), "rt", runtime)
+    end
+  end
+
   def add_xss_retry(job_id = SecureRandom.hex(12))
     msg = {"class" => "FailJob",
            "args" => ["<a>hello</a>"],
@@ -871,7 +967,7 @@ describe Sidekiq::Web do
            "error_message" => "fail message: <a>hello</a>",
            "error_class" => "RuntimeError",
            "retry_count" => 0,
-           "failed_at" => Time.now.to_f,
+           "failed_at" => Time.now.to_i * 1000,
            "jid" => SecureRandom.hex(12)}
     score = Time.now.to_f
     @config.redis do |conn|
@@ -900,12 +996,9 @@ describe Sidekiq::Web do
   describe "basic auth" do
     include Rack::Test::Methods
 
-    def app
-      app = Sidekiq::Web.new
-      app.use(Rack::Auth::Basic) { |user, pass| user == "a" && pass == "b" }
-      app.use(Rack::Session::Cookie, secret: SecureRandom.hex(32))
-
-      app
+    before do
+      Sidekiq::Web.use(Rack::Auth::Basic) { |user, pass| user == "a" && pass == "b" }
+      Sidekiq::Web.use(Rack::Session::Cookie, secret: SecureRandom.hex(32))
     end
 
     it "requires basic authentication" do
@@ -925,58 +1018,12 @@ describe Sidekiq::Web do
     end
   end
 
-  describe "custom session" do
-    include Rack::Test::Methods
-
-    def app
-      app = Sidekiq::Web.new
-      app.use Rack::Session::Cookie, secret: session_secret, host: "nicehost.org"
-      app
-    end
-
-    it "requires uses session options" do
-      get "/"
-
-      session_options = last_request.env["rack.session"].options
-
-      assert_equal session_secret, session_options[:secret]
-      assert_equal "nicehost.org", session_options[:host]
-    end
-  end
-
-  describe "redirecting in before" do
-    include Rack::Test::Methods
-
-    before do
-      Sidekiq::WebApplication.before { Thread.current[:some_setting] = :before }
-      Sidekiq::WebApplication.before { redirect "/" }
-      Sidekiq::WebApplication.after { Thread.current[:some_setting] = :after }
-    end
-
-    after do
-      Sidekiq::WebApplication.remove_instance_variable(:@befores)
-      Sidekiq::WebApplication.remove_instance_variable(:@afters)
-    end
-
-    def app
-      app = Sidekiq::Web.new
-      app.use Rack::Session::Cookie, secret: session_secret, host: "nicehost.org"
-      app
-    end
-
-    it "allows afters to run" do
-      get "/"
-      assert_equal :after, Thread.current[:some_setting]
-    end
-  end
-
   describe "Metrics" do
     before do
       require "sidekiq/component"
       require "sidekiq/metrics/tracking"
       t = Sidekiq::Metrics::ExecutionTracker.new(@config)
       t.track("default", "MikeJob") do
-        # TODO replace sleep with a method we can call
         sleep 0.02
       end
       t.flush
@@ -984,34 +1031,17 @@ describe Sidekiq::Web do
 
     describe "/metrics" do
       it "calls the Sidekiq::Metrics::Query and renders correctly" do
-        result_mock = Minitest::Mock.new
-        result_mock.expect(:job_results, {})
-        result_mock.expect(:marks, [])
-        result_mock.expect(:buckets, [])
-        result_mock.expect(:starts_at, Time.now - 3600)
-        result_mock.expect(:ends_at, Time.now)
-
-        query_mock = Minitest::Mock.new
-        query_mock.expect :top_jobs, result_mock do |minutes:|
-          assert_equal minutes, 240
-        end
-
-        Sidekiq::Metrics::Query.stub :new, query_mock do
-          get "/metrics", {period: "4h"}.compact
-          assert_equal 200, last_response.status
-          assert_match(/Metrics/, last_response.body)
-        end
+        get "/metrics", {period: "4h"}.compact
+        assert_equal 200, last_response.status
+        assert_match(/Metrics/, last_response.body)
       end
 
       it "supports filtering" do
-        get "/filter/metrics"
-        assert_equal 302, last_response.status
-
-        post "/filter/metrics", "substr" => "mike"
+        get "/metrics", "substr" => "mike"
         assert_equal 200, last_response.status
         assert_match(/MikeJob/, last_response.body)
 
-        post "/filter/metrics", "substr" => "notfound"
+        get "/metrics", "substr" => "notfound"
         assert_equal 200, last_response.status
         refute_match(/MikeJob/, last_response.body)
       end
@@ -1026,9 +1056,10 @@ describe Sidekiq::Web do
         result_mock = Minitest::Mock.new
         result_mock.expect(:job_results, {"FooJob" => job_result_mock})
         result_mock.expect(:starts_at, Time.now - 3600)
+        result_mock.expect(:starts_at, Time.now - 3600)
+        result_mock.expect(:ends_at, Time.now)
         result_mock.expect(:ends_at, Time.now)
         result_mock.expect(:marks, [])
-        result_mock.expect(:buckets, [])
 
         query_mock = Minitest::Mock.new
         query_mock.expect :for_job, result_mock do |job, minutes:|
@@ -1041,6 +1072,8 @@ describe Sidekiq::Web do
           assert_equal 200, last_response.status
           assert_match(/Metrics/, last_response.body)
           assert_match(/FooJob/, last_response.body)
+          assert_match(/8h/, last_response.body)
+          refute_match(/24h/, last_response.body)
         end
       end
     end

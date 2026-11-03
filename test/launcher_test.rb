@@ -16,6 +16,28 @@ describe Sidekiq::Launcher do
       refute_nil kb
       assert kb > 0
     end
+
+    it "reads memory for the requested pid, not the current process" do
+      skip "Linux-only /proc memory grabber" unless RUBY_PLATFORM.match?(/linux/)
+      # A non-existent pid must hit /proc/<pid>/status and fail, proving the
+      # grabber honors its argument rather than always reading the current process.
+      assert_raises(Errno::ENOENT) do
+        Sidekiq::Launcher::MEMORY_GRABBER.call(999_999_999)
+      end
+    end
+
+    it "reads memory for a process other than the current one" do
+      kb = Sidekiq::Launcher::MEMORY_GRABBER.call(Process.ppid)
+      assert_kind_of Integer, kb
+      assert kb > 0
+    end
+
+    it "reports memory usage through #memory_usage" do
+      launcher = Sidekiq::Launcher.new(@config)
+      kb = launcher.send(:memory_usage, Process.pid)
+      assert_kind_of Integer, kb
+      assert kb > 0
+    end
   end
 
   it "starts and stops" do
@@ -40,12 +62,14 @@ describe Sidekiq::Launcher do
     end
 
     it "stores process info in redis" do
-      @launcher.beat
+      @launcher.send(:beat)
 
       assert_equal "sidekiq #{Sidekiq::VERSION} myapp [1 of 3 busy]", $0
-      workers, rtt = @config.redis { |c| c.hmget(@id, "busy", "rtt_us") }
+      workers, concurrency, info, rtt = @config.redis { |c| c.hmget(@id, "busy", "concurrency", "info", "rtt_us") }
 
       assert_equal "1", workers
+      assert_equal "3", concurrency
+      refute_includes Sidekiq.load_json(info).keys, "concurrency"
       refute_nil rtt
       assert_in_delta 1000, rtt.to_i, 1000
 
@@ -68,11 +92,11 @@ describe Sidekiq::Launcher do
 
     it "quiets" do
       @launcher.quiet
-      @launcher.beat
+      @launcher.send(:beat)
 
       assert_equal "sidekiq #{Sidekiq::VERSION} myapp [1 of 3 busy] stopping", $0
 
-      @launcher.beat
+      @launcher.send(:beat)
       info = @config.redis { |c| c.hmget(@id, "busy") }
       assert_equal ["1"], info
 
@@ -82,7 +106,7 @@ describe Sidekiq::Launcher do
 
     it "allows arbitrary proctitle extensions" do
       Sidekiq::Launcher::PROCTITLES << proc { "xyz" }
-      @launcher.beat
+      @launcher.send(:beat)
       Sidekiq::Launcher::PROCTITLES.pop
       assert_equal "sidekiq #{Sidekiq::VERSION} myapp [1 of 3 busy] xyz", $0
     end

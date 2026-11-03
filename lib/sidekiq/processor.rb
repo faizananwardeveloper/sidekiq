@@ -3,6 +3,7 @@
 require "sidekiq/fetch"
 require "sidekiq/job_logger"
 require "sidekiq/job_retry"
+require "sidekiq/profiler"
 
 module Sidekiq
   ##
@@ -29,15 +30,16 @@ module Sidekiq
     attr_reader :capsule
 
     def initialize(capsule, &block)
-      @config = @capsule = capsule
+      @config = capsule.config
+      @capsule = capsule
       @callback = block
       @down = false
       @done = false
       @job = nil
       @thread = nil
       @reloader = Sidekiq.default_configuration[:reloader]
-      @job_logger = (capsule.config[:job_logger] || Sidekiq::JobLogger).new(logger)
-      @retrier = Sidekiq::JobRetry.new(capsule)
+      @job_logger = (capsule.config[:job_logger] || Sidekiq::JobLogger).new(@config)
+      @retrier = Sidekiq::JobRetry.new(@capsule)
     end
 
     def terminate(wait = false)
@@ -58,11 +60,15 @@ module Sidekiq
       @thread.value if wait
     end
 
-    def start
-      @thread ||= safe_thread("#{config.name}/processor", &method(:run))
+    def stopping?
+      @done
     end
 
-    private unless $TESTING
+    def start
+      @thread ||= safe_thread("#{capsule.name}/processor", &method(:run))
+    end
+
+    private
 
     def run
       # By setting this thread-local, Sidekiq.redis will access +Sidekiq::Capsule#redis_pool+
@@ -108,11 +114,15 @@ module Sidekiq
     def handle_fetch_exception(ex)
       unless @down
         @down = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
-        logger.error("Error fetching job: #{ex}")
         handle_exception(ex)
       end
       sleep(1)
       nil
+    end
+
+    def profile(job, &block)
+      return yield unless job["profile"]
+      Sidekiq::Profiler.new(config).call(job, &block)
     end
 
     def dispatch(job_hash, queue, jobstr)
@@ -128,16 +138,19 @@ module Sidekiq
         @retrier.global(jobstr, queue) do
           @job_logger.call(job_hash, queue) do
             stats(jobstr, queue) do
-              # Rails 5 requires a Reloader to wrap code execution.  In order to
-              # constantize the worker and instantiate an instance, we have to call
-              # the Reloader.  It handles code loading, db connection management, etc.
-              # Effectively this block denotes a "unit of work" to Rails.
-              @reloader.call do
-                klass = Object.const_get(job_hash["class"])
-                inst = klass.new
-                inst.jid = job_hash["jid"]
-                @retrier.local(inst, jobstr, queue) do
-                  yield inst
+              profile(job_hash) do
+                # Rails 5 requires a Reloader to wrap code execution.  In order to
+                # constantize the worker and instantiate an instance, we have to call
+                # the Reloader.  It handles code loading, db connection management, etc.
+                # Effectively this block denotes a "unit of work" to Rails.
+                @reloader.call do
+                  klass = Object.const_get(job_hash["class"])
+                  instance = klass.new
+                  instance.jid = job_hash["jid"]
+                  instance._context = self
+                  @retrier.local(instance, jobstr, queue) do
+                    yield instance
+                  end
                 end
               end
             end
@@ -160,7 +173,6 @@ module Sidekiq
       begin
         job_hash = Sidekiq.load_json(jobstr)
       rescue => ex
-        handle_exception(ex, {context: "Invalid JSON for job", jobstr: jobstr})
         now = Time.now.to_f
         redis do |conn|
           conn.multi do |xa|
@@ -169,15 +181,16 @@ module Sidekiq
             xa.zremrangebyrank("dead", 0, - @capsule.config[:dead_max_jobs])
           end
         end
+        handle_exception(ex, {context: "Invalid JSON for job", jobstr: jobstr})
         return uow.acknowledge
       end
 
       ack = false
       Thread.handle_interrupt(IGNORE_SHUTDOWN_INTERRUPTS) do
         Thread.handle_interrupt(ALLOW_SHUTDOWN_INTERRUPTS) do
-          dispatch(job_hash, queue, jobstr) do |inst|
-            config.server_middleware.invoke(inst, job_hash, queue) do
-              execute_job(inst, job_hash["args"])
+          dispatch(job_hash, queue, jobstr) do |instance|
+            config.server_middleware.invoke(instance, job_hash, queue) do
+              execute_job(instance, job_hash["args"])
             end
           end
           ack = true
@@ -185,6 +198,11 @@ module Sidekiq
           # Had to force kill this job because it didn't finish
           # within the timeout.  Don't acknowledge the work since
           # we didn't properly finish it.
+        rescue Sidekiq::JobRetry::Skip => s
+          # Skip means we handled this error elsewhere. We don't
+          # need to log or report the error.
+          ack = true
+          raise s
         rescue Sidekiq::JobRetry::Handled => h
           # this is the common case: job raised error and Sidekiq::JobRetry::Handled
           # signals that we created a retry successfully.  We can acknowledge the job.
@@ -206,8 +224,8 @@ module Sidekiq
       end
     end
 
-    def execute_job(inst, cloned_args)
-      inst.perform(*cloned_args)
+    def execute_job(instance, cloned_args)
+      instance.perform(*cloned_args)
     end
 
     # Ruby doesn't provide atomic counters out of the box so we'll
@@ -269,6 +287,8 @@ module Sidekiq
 
       begin
         yield
+      rescue JobRetry::Skip
+        raise
       rescue Exception
         FAILURE.incr
         raise

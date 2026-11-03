@@ -2,6 +2,7 @@
 
 require_relative "helper"
 require "sidekiq/web"
+require "yaml"
 
 class Helpers
   include Sidekiq::WebHelpers
@@ -22,12 +23,24 @@ class Helpers
     ["web/locales"]
   end
 
+  def config
+    self
+  end
+
   def env
     @thehash
   end
 
   def default
     {}
+  end
+
+  def session
+    {}
+  end
+
+  def csp_nonce
+    "12345678deadbeef"
   end
 
   def path_info
@@ -40,18 +53,44 @@ describe "Web helpers" do
     Sidekiq.redis { |c| c.flushdb }
   end
 
+  it "tests script_tag" do
+    obj = Helpers.new
+    assert_equal "<script type=\"text/javascript\" nonce=\"12345678deadbeef\" src=\"/sidekiq.js\"></script>", obj.script_tag("sidekiq.js")
+  end
+
+  it "tests style_tag" do
+    obj = Helpers.new
+    assert_equal ["<link type=\"text/css\" media=\"screen\" rel=\"stylesheet\" nonce=\"12345678deadbeef\" href=\"/sidekiq.css\" />"], obj.style_tag("sidekiq.css")
+  end
+
   it "tests locale determination" do
     obj = Helpers.new
     assert_equal "en", obj.locale
+
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en-US,EN;q=0.9,es;q=0.8,zh-TW;q=0.7,zh;q=0.6")
+    assert_equal "en", obj.locale
+
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en-US,es-MX;q=0.9")
+    assert_equal "en", obj.locale
+
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "ES-MX,EN-CA;q=0.9")
+    assert_equal "es", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "fr-FR,fr;q=0.8,en-US;q=0.6,en;q=0.4,ru;q=0.2")
     assert_equal "fr", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4,ru;q=0.2")
-    assert_equal "zh-cn", obj.locale
+    assert_equal "zh-CN", obj.locale
 
-    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en-US,sv-SE;q=0.8,sv;q=0.6,en;q=0.4")
-    assert_equal "en", obj.locale
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "zh-TW,zh;q=0.8,en-US;q=0.6,en;q=0.4,ru;q=0.2")
+    assert_equal "zh-TW", obj.locale
+
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "zh-HK,zh;q=0.9,ja-JP;q=0.8")
+    assert_equal "ja", obj.locale
+
+    # "en" comes first but "sv" has a higher quality value
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en-US,en;q=0.4,sv-SE;q=0.8,sv;q=0.6")
+    assert_equal "sv", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "nb-NO,nb;q=0.2")
     assert_equal "nb", obj.locale
@@ -59,17 +98,20 @@ describe "Web helpers" do
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en-us")
     assert_equal "en", obj.locale
 
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en-GB-oxendict")
+    assert_equal "en", obj.locale
+
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "sv-se")
     assert_equal "sv", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "pt-BR,pt;q=0.8,en-US;q=0.6,en;q=0.4")
-    assert_equal "pt-br", obj.locale
+    assert_equal "pt-BR", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "pt-PT,pt;q=0.8,en-US;q=0.6,en;q=0.4")
     assert_equal "pt", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "pt-br")
-    assert_equal "pt-br", obj.locale
+    assert_equal "pt-BR", obj.locale
 
     obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "pt-pt")
     assert_equal "pt", obj.locale
@@ -96,15 +138,30 @@ describe "Web helpers" do
     assert_equal "en", obj.locale
   end
 
-  it "tests user selected locale" do
-    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "*")
+  it "returns language name from locale" do
+    obj = Helpers.new
+    assert_equal "English", obj.language_name("en")
+    assert_equal "Português", obj.language_name("pt")
+    assert_equal "missing", obj.language_name("missing")
+  end
 
+  it "handles invalid locales" do
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "*")
+    obj.instance_eval do
+      def session
+        {locale: "xx"}
+      end
+    end
+    assert_equal "en", obj.locale
+  end
+
+  it "uses the user selected locale" do
+    obj = Helpers.new("HTTP_ACCEPT_LANGUAGE" => "en")
     obj.instance_eval do
       def session
         {locale: "es"}
       end
     end
-
     assert_equal "es", obj.locale
   end
 
@@ -112,8 +169,8 @@ describe "Web helpers" do
     obj = Helpers.new
     expected = %w[
       ar cs da de el en es fa fr gd he hi it ja
-      ko lt nb nl pl pt pt-br ru sv ta uk ur
-      vi zh-cn zh-tw
+      ko lt nb nl pl pt pt-BR ru sv ta tr uk ur
+      vi zh-CN zh-TW
     ]
     assert_equal expected, obj.available_locales.sort
   end
@@ -130,6 +187,29 @@ describe "Web helpers" do
     assert_equal "Invalid job payload, args is nil", s
   end
 
+  describe "#to_display" do
+    it "falls back to to_s when inspect raises" do
+      arg = Object.new
+      def arg.inspect = raise("no inspect")
+      def arg.to_s = "fallback value"
+      assert_equal "fallback value", Helpers.new.to_display(arg)
+    end
+
+    it "returns a safe message when both inspect and to_s raise" do
+      arg = Object.new
+      def arg.inspect = raise("no inspect")
+      def arg.to_s = raise(ArgumentError, "no to_s")
+      assert_equal "Cannot display argument: [ArgumentError] no to_s", Helpers.new.to_display(arg)
+    end
+  end
+
+  it "renders an arg via the to_s fallback and escapes it" do
+    arg = Object.new
+    def arg.inspect = raise("no inspect")
+    def arg.to_s = "<danger>"
+    assert_equal "&lt;danger&gt;", Helpers.new.display_args([arg])
+  end
+
   it "query string escapes bad query input" do
     obj = Helpers.new
     assert_equal "page=B%3CH", obj.to_query_string("page" => "B<H")
@@ -143,6 +223,58 @@ describe "Web helpers" do
       end
     end
     assert_equal "direction=H%3EB&page=B%3CH", obj.qparams("page" => "B<H")
+  end
+
+  describe "#h" do
+    it "escapes HTML special characters" do
+      obj = Helpers.new
+      assert_equal "&lt;a&gt; &amp; &quot;x&quot; &#39;y&#39;", obj.h(%q(<a> & "x" 'y'))
+    end
+
+    it "coerces non-strings before escaping" do
+      obj = Helpers.new
+      assert_equal "123", obj.h(123)
+    end
+  end
+
+  describe "#filter_link" do
+    it "escapes the value and wraps it in a filter link by default" do
+      obj = Helpers.new
+      assert_equal "<a href='/retries?substr=ab%3Cc'>ab&lt;c</a>", obj.filter_link("ab<c")
+    end
+
+    it "URL encodes the value in the link" do
+      obj = Helpers.new
+      assert_equal "<a href='/morgue?substr=a%26b+c%2B%2B%23x'>a&amp;b c++#x</a>", obj.filter_link("a&b c++#x", "morgue")
+    end
+
+    it "returns only the escaped value when within is nil" do
+      obj = Helpers.new
+      assert_equal "ab&lt;c", obj.filter_link("ab<c", nil)
+    end
+  end
+
+  describe "#display_tags" do
+    it "escapes tag content in both the label and the filter link" do
+      obj = Helpers.new
+      job = Struct.new(:tags).new(["a<b"])
+      result = obj.display_tags(job)
+      assert_includes result, "jobtag-a&lt;b"
+      assert_includes result, "substr=a%3Cb"
+    end
+  end
+
+  describe "#to_query_string" do
+    it "keeps safe params, drops unknown ones, and escapes values" do
+      obj = Helpers.new
+      qs = obj.to_query_string("page" => "2", "jid" => "abc", "direction" => "asc", "only" => "working")
+      assert_equal "page=2&direction=asc&only=working", qs
+    end
+
+    it "escapes reserved characters in values" do
+      obj = Helpers.new
+      assert_equal "page=a+b%26c", obj.to_query_string("page" => "a b&c")
+    end
   end
 
   describe "#format_memory" do
@@ -196,20 +328,6 @@ describe "Web helpers" do
     assert_equal ["worker_critical.1", "worker_critical.2", "worker_critical.10", "worker_default.1", "worker_default.2"], obj.sorted_processes.map { |process| process["hostname"] }
   end
 
-  it "displays queue weights properly" do
-    capsule_weights = [{"high" => 0, "default" => 0, "low" => 0}]
-    obj = Helpers.new
-    assert_equal "high, default, low", obj.busy_weights(capsule_weights)
-    capsule_weights = [{"high" => 3, "default" => 2, "low" => 1}, {"single" => 0}]
-    assert_equal "high: 3, default: 2, low: 1; single", obj.busy_weights(capsule_weights)
-    capsule_weights = [{"high" => 1, "default" => 1, "low" => 1}, {"single" => 0}]
-    assert_equal "high: 1, default: 1, low: 1; single", obj.busy_weights(capsule_weights)
-
-    # old data
-    capsule_weights = {"high" => 1, "default" => 1, "low" => 1}
-    assert_equal "high: 1, default: 1, low: 1", obj.busy_weights(capsule_weights)
-  end
-
   describe "#pollable?" do
     it "returns true if not the root or metrics path" do
       obj = Helpers.new({path_info: "/retries"})
@@ -225,6 +343,35 @@ describe "Web helpers" do
       obj = Helpers.new({path_info: "/"})
 
       assert_equal false, obj.pollable?
+    end
+  end
+
+  describe "#parse_yaml" do
+    it "can parse locale files" do
+      obj = Helpers.new
+      Dir["web/locales/*.yml"].each do |path|
+        ex = YAML.safe_load_file(path)
+        was = obj.parse_yaml(path)
+        assert_equal path, "web/locales/#{was.keys.first}.yml"
+        ex.values.first.zip(was.values.first).each do |expected, got|
+          assert_equal expected, got
+        end
+      end
+    end
+
+    it "can parse locale files when the external encoding is not UTF-8" do
+      obj = Helpers.new
+      previous = Encoding.default_external
+      verbose = $VERBOSE
+      $VERBOSE = false # setting default_external warns
+      Encoding.default_external = Encoding::US_ASCII
+
+      parsed = obj.parse_yaml("web/locales/en.yml")
+
+      assert_equal YAML.safe_load_file("web/locales/en.yml")["en"], parsed["en"]
+    ensure
+      Encoding.default_external = previous
+      $VERBOSE = verbose
     end
   end
 end

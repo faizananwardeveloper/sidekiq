@@ -58,6 +58,21 @@ module Sidekiq
       end
     end
 
+    # Cancel the IterableJob with the given JID.
+    # **NB: Cancellation is asynchronous.** Iteration checks every
+    # five seconds so this will not immediately stop the given job.
+    def cancel!(jid)
+      key = "it-#{jid}"
+      _, result, _ = Sidekiq.redis do |c|
+        c.pipelined do |p|
+          p.hsetnx(key, "cancelled", Time.now.to_i)
+          p.hget(key, "cancelled")
+          p.expire(key, Sidekiq::Job::Iterable::STATE_TTL, "nx")
+        end
+      end
+      result.to_i
+    end
+
     ##
     # The main method used to push a job to Redis.  Accepts a number of options:
     #
@@ -102,6 +117,14 @@ module Sidekiq
     # larger than 1000 but YMMV based on network quality, size of job args, etc.
     # A large number of jobs can cause a bit of Redis command processing latency.
     #
+    # Accepts an `:at` option to schedule the jobs for future execution. It
+    # accepts either a single Numeric timestamp (or seconds-from-now) applied
+    # to every job, or an Array of Numeric values with the same size as `args`
+    # to schedule each job at its corresponding time.
+    #
+    # Accepts an additional `:spread_interval` option (in seconds) to randomly spread
+    # the jobs schedule times over the specified interval.
+    #
     # Takes the same arguments as #push except that args is expected to be
     # an Array of Arrays.  All other keys are duplicated for each job.  Each job
     # is run through the client middleware pipeline and each job gets its own Job ID
@@ -114,14 +137,27 @@ module Sidekiq
     #   push_bulk('class' => MyJob, 'args' => (1..100_000).to_a, batch_size: 1_000)
     #
     def push_bulk(items)
-      batch_size = items.delete(:batch_size) || items.delete("batch_size") || 1_000
       args = items["args"]
-      at = items.delete("at")
+      at = items.delete("at") || items.delete(:at)
       raise ArgumentError, "Job 'at' must be a Numeric or an Array of Numeric timestamps" if at && (Array(at).empty? || !Array(at).all? { |entry| entry.is_a?(Numeric) })
       raise ArgumentError, "Job 'at' Array must have same size as 'args' Array" if at.is_a?(Array) && at.size != args.size
 
       jid = items.delete("jid")
       raise ArgumentError, "Explicitly passing 'jid' when pushing more than one job is not supported" if jid && args.size > 1
+
+      spread_interval = items.delete(:spread_interval) || items.delete("spread_interval")
+      raise ArgumentError, "Jobs 'spread_interval' must be a positive Numeric" if spread_interval && (!spread_interval.is_a?(Numeric) || spread_interval <= 0)
+      raise ArgumentError, "Only one of 'at' or 'spread_interval' can be provided" if at && spread_interval
+
+      if !at && spread_interval
+        # Do not use spread interval smaller than pooling interval.
+        spread_interval = [spread_interval, 5].max
+        now = Time.now.to_f
+        at = args.map { now + rand * spread_interval }
+      end
+
+      # Use a smaller batch size by default for scheduled jobs since adding to sorted sets is more costly.
+      batch_size = items.delete(:batch_size) || items.delete("batch_size") || (at ? 100 : 1_000)
 
       normed = normalize_item(items)
       slice_index = 0
@@ -248,20 +284,22 @@ module Sidekiq
     def atomic_push(conn, payloads)
       if payloads.first.key?("at")
         conn.zadd("schedule", payloads.flat_map { |hash|
-          at = hash.delete("at").to_s
-          # ActiveJob sets this but the job has not been enqueued yet
-          hash.delete("enqueued_at")
+          at = hash["at"].to_s
+          # ActiveJob sets enqueued_at but the job has not been enqueued yet
+          hash = hash.except("enqueued_at", "at")
           [at, Sidekiq.dump_json(hash)]
         })
       else
-        queue = payloads.first["queue"]
-        now = Time.now.to_f
-        to_push = payloads.map { |entry|
-          entry["enqueued_at"] = now
-          Sidekiq.dump_json(entry)
-        }
-        conn.sadd("queues", [queue])
-        conn.lpush("queue:#{queue}", to_push)
+        now = ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond) # milliseconds since the epoch
+        grouped_queues = payloads.group_by { |job| job["queue"] }
+        conn.sadd("queues", grouped_queues.keys)
+        grouped_queues.each do |queue, grouped_payloads|
+          to_push = grouped_payloads.map { |entry|
+            entry["enqueued_at"] = now
+            Sidekiq.dump_json(entry)
+          }
+          conn.lpush("queue:#{queue}", to_push)
+        end
       end
     end
   end

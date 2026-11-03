@@ -7,6 +7,7 @@ require "sidekiq/capsule"
 module Sidekiq # :nodoc:
   class BasicFetch
     include Sidekiq::Component
+
     # We want the fetch operation to timeout every few seconds so the thread
     # can check if the process is shutting down.
     TIMEOUT = 2
@@ -44,7 +45,7 @@ module Sidekiq # :nodoc:
         return nil
       end
 
-      queue, job = redis { |conn| conn.blocking_call(conn.read_timeout + TIMEOUT, "brpop", *qs, TIMEOUT) }
+      queue, job = redis { |conn| conn.blocking_call(TIMEOUT, "brpop", *qs, TIMEOUT) }
       UnitOfWork.new(queue, job, config) if queue
     end
 

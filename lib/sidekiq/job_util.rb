@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "securerandom"
 require "time"
 
@@ -56,8 +58,12 @@ module Sidekiq
       item["class"] = item["class"].to_s
       item["queue"] = item["queue"].to_s
       item["retry_for"] = item["retry_for"].to_i if item["retry_for"]
-      item["created_at"] ||= Time.now.to_f
+      item["created_at"] ||= now_in_millis
       item
+    end
+
+    def now_in_millis
+      ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond)
     end
 
     def normalized_hash(item_class)
@@ -73,7 +79,12 @@ module Sidekiq
 
     RECURSIVE_JSON_UNSAFE = {
       Integer => ->(val) {},
-      Float => ->(val) {},
+      Float => ->(val) {
+        # JSON does not allow NaN / Infinity; reject them so strict_args!
+        # raises ArgumentError instead of a cryptic JSON::GeneratorError later.
+        return val unless val.finite?
+        nil
+      },
       TrueClass => ->(val) {},
       FalseClass => ->(val) {},
       NilClass => ->(val) {},

@@ -11,7 +11,7 @@ var updateStatsSummary = function(data) {
 }
 
 var updateRedisStats = function(data) {
-  document.getElementById('redis_version').innerText = data.redis_version;
+  document.getElementById('redis_version').innerText = data.store_version;
   document.getElementById('uptime_in_days').innerText = data.uptime_in_days;
   document.getElementById('connected_clients').innerText = data.connected_clients;
   document.getElementById('used_memory_human').innerText = data.used_memory_human;
@@ -28,12 +28,18 @@ var pulseBeacon = function() {
 }
 
 var setSliderLabel = function(val) {
-  document.getElementById('sldr-text').innerText = Math.round(parseFloat(val) / 1000) + ' sec';
+  document.getElementById('sldr-text').innerText = Math.round(parseFloat(val) / 1000) + ' s';
 }
 
 var ready = (callback) => {
   if (document.readyState != "loading") callback();
   else document.addEventListener("DOMContentLoaded", callback);
+}
+
+var updateScreenReaderDashboardValues = function(processed, failed) {
+  let lastDashboardUpdateSpan = document.getElementById("sr-last-dashboard-update");
+  var updateText = document.getElementById("sr-last-dashboard-update-template").innerText;
+  lastDashboardUpdateSpan.innerText = updateText.replace("PROCESSED_COUNT", processed).replace("FAILED_COUNT", failed);
 }
 
 ready(() => {

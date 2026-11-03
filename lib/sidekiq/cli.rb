@@ -2,8 +2,6 @@
 
 $stdout.sync = true
 
-require "yaml"
-require "singleton"
 require "optparse"
 require "erb"
 require "fileutils"
@@ -17,7 +15,6 @@ require "sidekiq/launcher"
 module Sidekiq # :nodoc:
   class CLI
     include Sidekiq::Component
-    include Singleton unless $TESTING
 
     attr_accessor :launcher
     attr_accessor :environment
@@ -29,6 +26,10 @@ module Sidekiq # :nodoc:
       setup_options(args)
       initialize_logger
       validate!
+    end
+
+    def self.instance
+      @instance ||= new
     end
 
     def jruby?
@@ -47,7 +48,7 @@ module Sidekiq # :nodoc:
       logger.info "Booted Rails #{::Rails.version} application in #{environment} environment" if rails_app?
 
       self_read, self_write = IO.pipe
-      sigs = %w[INT TERM TTIN TSTP]
+      sigs = %w[INT TERM INFO TTIN TSTP]
       # USR1 and USR2 don't work on the JVM
       sigs << "USR2" if Sidekiq.pro? && !jruby?
       sigs.each do |sig|
@@ -74,7 +75,7 @@ module Sidekiq # :nodoc:
       # fire startup and start multithreading.
       info = @config.redis_info
       ver = Gem::Version.new(info["redis_version"])
-      raise "You are connecting to Redis #{ver}, Sidekiq requires Redis 6.2.0 or greater" if ver < Gem::Version.new("6.2.0")
+      raise "You are connected to Redis #{ver}, Sidekiq requires Redis 7.0.0 or greater" if ver < Gem::Version.new("7.0.0")
 
       maxmemory_policy = info["maxmemory_policy"]
       if maxmemory_policy != "noeviction" && maxmemory_policy != ""
@@ -101,7 +102,7 @@ module Sidekiq # :nodoc:
       # Touch middleware so it isn't lazy loaded by multiple threads, #3043
       @config.server_middleware
 
-      ::Process.warmup if warmup && ::Process.respond_to?(:warmup)
+      ::Process.warmup if warmup && ::Process.respond_to?(:warmup) && ENV["RUBY_DISABLE_WARMUP"] != "1"
 
       # Before this point, the process is initializing with just the main thread.
       # Starting here the process will now have multiple threads running.
@@ -143,7 +144,7 @@ module Sidekiq # :nodoc:
 
     HOLIDAY_COLORS = {
       # got other color-specific holidays from around the world?
-      # https://developer-book.com/post/definitive-guide-for-colored-text-in-terminal/#256-color-escape-codes
+      # https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
       "3-17" => "\e[1;32m", # St. Patrick's Day green
       "10-31" => "\e[38;5;208m" # Halloween orange
     }
@@ -208,14 +209,25 @@ module Sidekiq # :nodoc:
             cli.logger.warn "<no backtrace available>"
           end
         end
+      },
+      "INFO" => ->(cli) {
+        cli.logger.error { "DEPRECATED: the INFO signal does not work on Linux, use TTIN instead." }
+        Thread.list.each do |thread|
+          cli.logger.warn "Thread TID-#{(thread.object_id ^ ::Process.pid).to_s(36)} #{thread.name}"
+          if thread.backtrace
+            cli.logger.warn thread.backtrace.join("\n")
+          else
+            cli.logger.warn "<no backtrace available>"
+          end
+        end
       }
     }
-    UNHANDLED_SIGNAL_HANDLER = ->(cli) { cli.logger.info "No signal handler registered, ignoring" }
-    SIGNAL_HANDLERS.default = UNHANDLED_SIGNAL_HANDLER
 
     def handle_signal(sig)
       logger.debug "Got #{sig} signal"
-      SIGNAL_HANDLERS[sig].call(self)
+      hndlr = SIGNAL_HANDLERS[sig]
+      hndlr ? hndlr.call(self) :
+        logger.warn("No #{sig} signal handler registered, ignoring")
     end
 
     private
@@ -298,27 +310,16 @@ module Sidekiq # :nodoc:
 
       if File.directory?(@config[:require])
         require "rails"
-        if ::Rails::VERSION::MAJOR < 6
-          warn "Sidekiq #{Sidekiq::VERSION} only supports Rails 6+"
+        if ::Rails::VERSION::MAJOR < 7
+          warn "Sidekiq #{Sidekiq::VERSION} only supports Rails 7+"
         end
         require "sidekiq/rails"
         require File.expand_path("#{@config[:require]}/config/environment.rb")
-        @config[:tag] ||= default_tag
+        @config[:tag] ||= default_tag(::Rails.root)
       else
         require @config[:require]
+        @config[:tag] ||= default_tag
       end
-    end
-
-    def default_tag
-      dir = ::Rails.root
-      name = File.basename(dir)
-      prevdir = File.dirname(dir) # Capistrano release directory?
-      if name.to_i != 0 && prevdir
-        if File.basename(prevdir) == "releases"
-          return File.basename(File.dirname(prevdir))
-        end
-      end
-      name
     end
 
     def validate!
@@ -395,12 +396,18 @@ module Sidekiq # :nodoc:
     end
 
     def initialize_logger
-      @config.logger.level = ::Logger::DEBUG if @config[:verbose]
+      if @config[:verbose] || ENV["DEBUG_INVOCATION"] == "1"
+        # DEBUG_INVOCATION is a systemd-ism triggered by
+        # RestartMode=debug. We turn on debugging when the
+        # sidekiq process crashes and is restarted with this flag.
+        @config.logger.level = ::Logger::DEBUG
+      end
     end
 
     def parse_config(path)
       erb = ERB.new(File.read(path), trim_mode: "-")
       erb.filename = File.expand_path(path)
+      require "yaml"
       opts = YAML.safe_load(erb.result, permitted_classes: [Symbol], aliases: true) || {}
 
       if opts.respond_to? :deep_symbolize_keys!
@@ -423,3 +430,4 @@ end
 
 require "sidekiq/systemd"
 require "sidekiq/metrics/tracking"
+require "sidekiq/job/interrupt_handler"

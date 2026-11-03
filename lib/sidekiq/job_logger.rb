@@ -1,23 +1,29 @@
 # frozen_string_literal: true
 
+require "sidekiq/job_retry"
+
 module Sidekiq
   class JobLogger
-    def initialize(logger)
-      @logger = logger
+    def initialize(config)
+      @config = config
+      @logger = @config.logger
+      @skip = !!@config[:skip_default_job_logging]
     end
 
     def call(item, queue)
       start = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
-      @logger.info("start")
+      @logger.info { "start" } unless @skip
 
       yield
 
       Sidekiq::Context.add(:elapsed, elapsed(start))
-      @logger.info("done")
+      @logger.info { "done" } unless @skip
+    rescue JobRetry::Skip
+      Sidekiq::Context.add(:elapsed, elapsed(start))
+      raise
     rescue Exception
       Sidekiq::Context.add(:elapsed, elapsed(start))
-      @logger.info("fail")
-
+      @logger.info { "fail" } unless @skip
       raise
     end
 
@@ -25,16 +31,18 @@ module Sidekiq
       # If we're using a wrapper class, like ActiveJob, use the "wrapped"
       # attribute to expose the underlying thing.
       h = {
-        class: job_hash["display_class"] || job_hash["wrapped"] || job_hash["class"],
-        jid: job_hash["jid"]
+        jid: job_hash["jid"],
+        class: job_hash["wrapped"] || job_hash["class"]
       }
-      h[:bid] = job_hash["bid"] if job_hash.has_key?("bid")
-      h[:tags] = job_hash["tags"] if job_hash.has_key?("tags")
+
+      @config[:logged_job_attributes].each do |attr|
+        h[attr.to_sym] = job_hash[attr] if job_hash.has_key?(attr)
+      end
 
       Thread.current[:sidekiq_context] = h
       level = job_hash["log_level"]
-      if level && @logger.respond_to?(:log_at)
-        @logger.log_at(level, &block)
+      if level
+        @logger.with_level(level, &block)
       else
         yield
       end

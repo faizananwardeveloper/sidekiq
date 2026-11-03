@@ -1,20 +1,34 @@
-require "concurrent"
+# frozen_string_literal: true
 
 module Sidekiq
   module Metrics
-    # This is the only dependency on concurrent-ruby in Sidekiq but it's
-    # mandatory for thread-safety until MRI supports atomic operations on values.
-    Counter = ::Concurrent::AtomicFixnum
+    class Counter
+      def initialize
+        @value = 0
+        @lock = Mutex.new
+      end
+
+      def increment
+        @lock.synchronize { @value += 1 }
+      end
+
+      def value
+        @lock.synchronize { @value }
+      end
+    end
 
     # Implements space-efficient but statistically useful histogram storage.
     # A precise time histogram stores every time. Instead we break times into a set of
     # known buckets and increment counts of the associated time bucket. Even if we call
     # the histogram a million times, we'll still only store 26 buckets.
-    # NB: needs to be thread-safe or resiliant to races.
+    # NB: needs to be thread-safe or resilient to races.
     #
     # To store this data, we use Redis' BITFIELD command to store unsigned 16-bit counters
     # per bucket per klass per minute. It's unlikely that most people will be executing more
-    # than 1000 job/sec for a full minute of a specific type.
+    # than 1000 job/sec for a full minute of a specific type (i.e. overflow 65,536).
+    #
+    # Histograms are only stored at the fine-grained level, they are not rolled up
+    # for longer-term buckets.
     class Histogram
       include Enumerable
 
@@ -71,15 +85,15 @@ module Sidekiq
       end
 
       def fetch(conn, now = Time.now)
-        window = now.utc.strftime("%d-%H:%-M")
-        key = "#{@klass}-#{window}"
+        window = now.utc.strftime("%-d-%-H:%-M")
+        key = "h|#{@klass}-#{window}"
         conn.bitfield_ro(key, *FETCH)
       end
 
       def persist(conn, now = Time.now)
         buckets, @buckets = @buckets, []
-        window = now.utc.strftime("%d-%H:%-M")
-        key = "#{@klass}-#{window}"
+        window = now.utc.strftime("%-d-%-H:%-M")
+        key = "h|#{@klass}-#{window}"
         cmd = [key, "OVERFLOW", "SAT"]
         buckets.each_with_index do |counter, idx|
           val = counter.value

@@ -21,6 +21,7 @@ end
 class CustomJob
   $recorder = []
   include Sidekiq::Job
+
   def perform(recorder)
     $recorder << ["job_performed"]
   end
@@ -65,6 +66,7 @@ end
 
 class FooC
   include Sidekiq::ClientMiddleware
+
   def initialize(*args)
     @args = args
   end
@@ -100,7 +102,7 @@ describe Sidekiq::Middleware do
     end
 
     processor = Sidekiq::Processor.new(@config.default_capsule) { |pr, ex| }
-    processor.process(Sidekiq::BasicFetch::UnitOfWork.new("queue:default", msg))
+    processor.send(:process, Sidekiq::BasicFetch::UnitOfWork.new("queue:default", msg))
     assert_equal %w[2 before 3 before 1 before job_performed 1 after 3 after 2 after], $recorder.flatten
   end
 

@@ -10,6 +10,7 @@ end
 
 class ShardMiddleware
   include Sidekiq::ClientMiddleware
+
   def call(wrkr, job, q, pool)
     # set a flag so we can inspect which shard is active
     redis { |c| c.set("flag", job["jid"]) }
@@ -23,7 +24,9 @@ describe "Sharding" do
   before do
     @config = reset!
     @sh1 = Sidekiq::RedisConnection.create(size: 1, db: 6)
+    @sh1.with { |c| c.flushdb }
     @sh2 = Sidekiq::RedisConnection.create(size: 1, db: 5)
+    @sh2.with { |c| c.flushdb }
   end
 
   after do
@@ -87,6 +90,26 @@ describe "Sharding" do
 
       assert_equal 0, ss.size
       assert_equal 0, q.size
+    end
+
+    describe ".via" do
+      it "rejects a nil pool with the documented message" do
+        err = assert_raises(ArgumentError) { Sidekiq::Client.via(nil) {} }
+        assert_match(/No pool given/, err.message)
+      end
+
+      it "restores the previous thread-local pool even when the block raises" do
+        Thread.current[:sidekiq_redis_pool] = :outer
+
+        assert_raises(RuntimeError) do
+          Sidekiq::Client.via(@sh1) { raise "boom" }
+        end
+
+        assert_equal :outer, Thread.current[:sidekiq_redis_pool],
+          "expected Client.via to restore the prior thread-local pool on exception"
+      ensure
+        Thread.current[:sidekiq_redis_pool] = nil
+      end
     end
   end
 end

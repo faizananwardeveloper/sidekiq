@@ -7,6 +7,102 @@ Please see [sidekiq.org](https://sidekiq.org) for more details and how to buy.
 HEAD
 ---------
 
+- Rate limiters can now target a specific Redis shard via `Sidekiq::Limiter.via`, similar to `Sidekiq::Client.via`. See wiki page for more detail.
+- Add Ukranian locale
+- Vendor code to remove `gserver` gem dependency [#7084]
+- Vendor code to remove `get_process_mem` gem dependency [#7084]
+- Make the `einhorn` dependency optional since it is only required for rolling restarts [#7084]
+
+8.1.2
+---------
+
+- Remove ActiveSupport dependency in 8.1.1 [#6965]
+
+8.1.1
+---------
+
+- Support for `kiq`
+
+8.1.0
+---------
+
+- Better periodic UI styling
+- Integrate herb, connection_pool 3.0
+
+8.0.3
+---------
+
+- Fix Herb lint warnings in ERB templates
+- Historical metrics subsystem now immediately shuts down upon TERM
+
+8.0.2
+---------
+
+- Rewrite swarm memory tracking to use the `get_process_mem` gem which should allow
+  operation on Alpine Linux, Windows, etc. [#6752]
+- Handle fractional values for SIDEKIQ_COUNT, e.g. "0.25", when running
+  on low-end VMs allocated only a partial core. [#6244]
+
+8.0.1
+---------
+
+- The Web UI can now pause, unpause and manually enqueue periodic jobs. [#6675]
+
+8.0.0
+---------
+
+- Please note the [upgrade docs](https://github.com/sidekiq/sidekiq/blob/main/docs/Pro-8.0-Upgrade.md) if you use
+Sidekiq Batches.
+  You need to run Sidekiq Pro 7.3.x long enough to ensure all persistent batch data in Redis is compatible with Batch 8.0.
+- Move from SHA1 to SHA256 internally. Unique locks are now SHA256 but only take 10% more
+  space due to a more efficient encoding (base64 vs hex).
+- Sidekiq::Web internal refactoring [#6532]
+- Limiter factory methods now raise ArgumentError if you pass them a block [#6512]
+
+7-x
+---------
+
+- Backport leaky limiter fix for #6641
+
+7.3.4
+---------
+
+- Tune `inspect` to avoid huge output [#6553]
+- Use backported APIs for Web extension
+
+7.3.3
+---------
+
+- Call `Process.warmup` before fork in sidekiqswarm, use `RUBY_DISABLE_WARMUP=1` to disable [#6279]
+- Disable health checks if running sidekiqswarm, we can't use one port to monitor many children
+
+7.3.2
+---------
+
+- Activate unique server middleware in client-mode so uniqueness works for `perform_inline` [#6460]
+- Add `Sidekiq::Enterprise.gem_version` API
+
+7.3.1
+---------
+
+- Fix healthcheck when defined in config YML [#6352]
+
+7.3.0
+---------
+
+- Allow rate limiting to use Redis Cluster [#6288]
+- Remove `base64` gem dependency
+
+7.2.4
+---------
+
+- Revert #6288 as this requires Sidekiq 7.3 [#6324]
+
+7.2.3
+---------
+
+- Adjust the unlimited rate limiter to work as a points limiter too [#6301]
+- Limiters can now use a clustered Redis client [#6288]
 - Limiters now have attr_readers for all static config elements [#6259]
 - Handle fractional values for SIDEKIQ_COUNT when containers have fractional CPU allocations,
   e.g. `SIDEKIQ_COUNT=2.5` will create 2 Sidekiq processes. [#6244]

@@ -72,7 +72,7 @@ describe "logger" do
 
   it "tests formatted output" do
     @logger.info("hello world")
-    assert_match(/INFO: hello world/, @output.string)
+    assert_match(/INFO.+: hello world/, @output.string)
     reset(@output)
 
     formats = [Sidekiq::Logger::Formatters::Pretty,
@@ -114,14 +114,14 @@ describe "logger" do
 
   it "tests forwards logger kwards" do
     assert_silent do
-      logger = Sidekiq::Logger.new("/dev/null", level: Logger::INFO)
+      logger = Sidekiq::Logger.new(File::NULL, level: Logger::INFO)
 
       assert_equal Logger::INFO, logger.level
     end
   end
 
   it "tests log level query methods" do
-    logger = Sidekiq::Logger.new("/dev/null", level: Logger::INFO)
+    logger = Sidekiq::Logger.new(File::NULL, level: Logger::INFO)
 
     refute_predicate logger, :debug?
     assert_predicate logger, :info?
@@ -130,6 +130,31 @@ describe "logger" do
     logger.level = Logger::WARN
     refute_predicate logger, :info?
     assert_predicate logger, :warn?
+  end
+
+  it "emits plain (uncoloured) output with the Plain formatter" do
+    @logger.formatter = Sidekiq::Logger::Formatters::Plain.new
+    @logger.info("plain message")
+
+    line = @output.string
+    assert_match(/\AINFO \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z pid=#{$$} tid=\S+: plain message\n\z/, line)
+    refute_match(/\e\[/, line, "Plain formatter should not emit ANSI colour escapes")
+  end
+
+  it "joins Array context values with commas in format_context" do
+    fmt = Sidekiq::Logger::Formatters::Plain.new
+    formatted = fmt.send(:format_context, tags: ["a", "b", "c"], jid: "abc")
+    assert_equal " tags=a,b,c jid=abc", formatted
+  end
+
+  it "restores the previous Sidekiq::Context after Context.with even when the block raises" do
+    Sidekiq::Context.with(outer: "yes") do
+      assert_raises(RuntimeError) do
+        Sidekiq::Context.with(inner: "yes") { raise "boom" }
+      end
+      assert_equal({outer: "yes"}, Sidekiq::Context.current,
+        "Context.with must restore the prior context even on exception")
+    end
   end
 
   def reset(io)

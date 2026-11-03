@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 
+ENV["RUBY_TCP_NO_FAST_FALLBACK"] = "1"
+
 #
 # bin/sidekiqload is a helpful script to load test and
 # performance tune Sidekiq's core. It creates 500,000 no-op
@@ -28,7 +30,7 @@ require "ruby-prof" if ENV["PROFILE"]
 require "bundler/setup"
 Bundler.require(:default, :load_test)
 
-latency = Integer(ENV["LATENCY"] || 1)
+latency = Integer(ENV["LATENCY"] || 0)
 if latency > 0
   # brew tap shopify/shopify
   # brew install toxiproxy
@@ -50,7 +52,7 @@ if ENV["AJ"]
   ActiveJob::Base.logger.level = Logger::WARN
 
   class LoadJob < ActiveJob::Base
-    def perform(idx, ts = nil)
+    def perform(string, idx, hash, ts = nil)
       puts(Time.now.to_f - ts) if !ts.nil?
     end
   end
@@ -58,12 +60,21 @@ end
 
 class LoadWorker
   include Sidekiq::Job
+  $count = 0
+  $lock = Mutex.new
+ 
   sidekiq_options retry: 1
   sidekiq_retry_in do |x|
     1
   end
 
-  def perform(idx, ts = nil)
+  def perform(string, idx, hash, ts = nil)
+    $lock.synchronize do
+      $count += 1
+      if $count % 100_000 == 0
+        logger.warn("#{Time.now} Done #{$count}")
+      end
+    end
     puts(Time.now.to_f - ts) if !ts.nil?
     # raise idx.to_s if idx % 100 == 1
   end
@@ -77,7 +88,7 @@ class Loader
   def initialize
     @iter = ENV["GC"] ? 10 : 500
     @count = Integer(ENV["COUNT"] || 1_000)
-    @latency = Integer(ENV["LATENCY"] || 1)
+    @latency = Integer(ENV["LATENCY"] || 0)
   end
 
   def configure
@@ -128,18 +139,18 @@ class Loader
   end
 
   def setup
-    Sidekiq.logger.error("Setup RSS: #{Process.rss}")
+    Sidekiq.logger.warn("Setup RSS: #{Process.rss}")
     Sidekiq.redis { |c| c.flushdb }
     start = Time.now
     if ENV["AJ"]
       @iter.times do
-        @count.times do |idx|
-          LoadJob.perform_later(idx)
-        end
+        ActiveJob.perform_all_later(@count.times.map do |idx|
+          LoadJob.new("mike", idx, {mike: "bob"})
+        end)
       end
     else
       @iter.times do
-        arr = Array.new(@count) { |idx| [idx] }
+        arr = Array.new(@count) { |idx| ["string", idx, {"mike" => "bob"}] }
         Sidekiq::Client.push_bulk("class" => LoadWorker, "args" => arr)
       end
     end
@@ -158,18 +169,18 @@ class Loader
         if total == 0
           ending = Time.now - @start
           size = @iter * @count
-          Sidekiq.logger.error("Done, #{size} jobs in #{ending} sec, #{(size / ending).to_i} jobs/sec")
-          Sidekiq.logger.error("Ending RSS: #{Process.rss}")
-          Sidekiq.logger.error("Now here's the latency for three jobs")
+          Sidekiq.logger.warn("Done, #{size} jobs in #{ending} sec, #{(size / ending).to_i} jobs/sec")
+          Sidekiq.logger.warn("Ending RSS: #{Process.rss}")
+          Sidekiq.logger.warn("Now here's the latency for three jobs")
 
           if ENV["AJ"]
-            LoadJob.perform_later(1, Time.now.to_f)
-            LoadJob.perform_later(2, Time.now.to_f)
-            LoadJob.perform_later(3, Time.now.to_f)
+            LoadJob.perform_later("", 1, {}, Time.now.to_f)
+            LoadJob.perform_later("", 2, {}, Time.now.to_f)
+            LoadJob.perform_later("", 3, {}, Time.now.to_f)
           else
-            LoadWorker.perform_async(1, Time.now.to_f)
-            LoadWorker.perform_async(2, Time.now.to_f)
-            LoadWorker.perform_async(3, Time.now.to_f)
+            LoadWorker.perform_async("", 1, {}, Time.now.to_f)
+            LoadWorker.perform_async("", 2, {}, Time.now.to_f)
+            LoadWorker.perform_async("", 3, {}, Time.now.to_f)
           end
 
           sleep 0.1
@@ -182,7 +193,7 @@ class Loader
   end
 
   def with_latency(latency, &block)
-    Sidekiq.logger.error "Simulating #{latency}ms of latency between Sidekiq and redis"
+    Sidekiq.logger.warn "Simulating #{latency}ms of latency between Sidekiq and redis"
     if latency > 0
       Toxiproxy[:redis].downstream(:latency, latency: latency).apply(&block)
     else
@@ -195,8 +206,8 @@ class Loader
     monitor
 
     if ENV["PROFILE"]
-      RubyProf.exclude_threads = [@monitor]
-      RubyProf.start
+      $profile = RubyProf::Profile.new(exclude_threads: [@monitor])
+      $profile.start
     elsif ENV["GC"]
       GC.start
       GC.compact
@@ -227,7 +238,7 @@ class Loader
     Sidekiq.logger.error("GC End RSS: #{Process.rss}") if ENV["GC"]
     if ENV["PROFILE"]
       Sidekiq.logger.error("Profiling...")
-      result = RubyProf.stop
+      result = $profile.stop
       printer = RubyProf::GraphHtmlPrinter.new(result)
       printer.print(File.new("output.html", "w"), min_percent: 1)
     end

@@ -72,6 +72,7 @@ module Sidekiq
       include Sidekiq::Component
 
       INITIAL_WAIT = 10
+      attr_accessor :rnd
 
       def initialize(config)
         @config = config
@@ -80,6 +81,7 @@ module Sidekiq
         @done = false
         @thread = nil
         @count_calls = 0
+        @rnd = Random.new
       end
 
       # Shut down this instance, will pause until the thread is dead.
@@ -115,9 +117,7 @@ module Sidekiq
       private
 
       def wait
-        @sleeper.pop(random_poll_interval)
-      rescue Timeout::Error
-        # expected
+        @sleeper.pop(timeout: random_poll_interval, exception: false)
       rescue => ex
         # if poll_interval_average hasn't been calculated yet, we can
         # raise an error trying to reach Redis.
@@ -151,11 +151,11 @@ module Sidekiq
 
         if count < 10
           # For small clusters, calculate a random interval that is ±50% the desired average.
-          interval * rand + interval.to_f / 2
+          interval * @rnd.rand + interval.to_f / 2
         else
           # With 10+ processes, we should have enough randomness to get decent polling
           # across the entire timespan
-          interval * rand
+          interval * @rnd.rand * 2
         end
       end
 
@@ -223,8 +223,7 @@ module Sidekiq
         total += INITIAL_WAIT unless @config[:poll_interval_average]
         total += (5 * rand)
 
-        @sleeper.pop(total)
-      rescue Timeout::Error
+        @sleeper.pop(timeout: total, exception: false)
       ensure
         # periodically clean out the `processes` set in Redis which can collect
         # references to dead processes over time. The process count affects how

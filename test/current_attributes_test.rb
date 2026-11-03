@@ -2,7 +2,6 @@
 
 require_relative "helper"
 require "sidekiq/middleware/current_attributes"
-require "sidekiq/fetch"
 
 module Myapp
   class Current < ActiveSupport::CurrentAttributes
@@ -14,22 +13,36 @@ module Myapp
   end
 end
 
-describe "Current attributes" do
-  before do
+class CurrentAttributesJob
+  include Sidekiq::Job
+
+  def perform
+  end
+end
+
+Serializer = ActiveJob::Arguments
+
+class TestCurrentAttributes < Minitest::Test
+  def setup
     @config = reset!
   end
 
-  it "saves" do
+  def run
+    # Rails reloader auto-clears context
+    Rails.application.reloader.wrap { super }
+  end
+
+  def test_saves
     cm = Sidekiq::CurrentAttributes::Save.new({
       "cattr" => "Myapp::Current",
       "cattr_1" => "Myapp::OtherCurrent"
     })
     job = {}
-    with_context("Myapp::Current", :user_id, 123) do
-      with_context("Myapp::OtherCurrent", :other_id, 789) do
+    with_context("Myapp::Current", "user_id", 123) do
+      with_context("Myapp::OtherCurrent", "other_id", 789) do
         cm.call(nil, job, nil, nil) do
-          assert_equal 123, job["cattr"][:user_id]
-          assert_equal 789, job["cattr_1"][:other_id]
+          assert_equal 123, Serializer.deserialize(job["cattr"]).to_h[:user_id]
+          assert_equal 789, Serializer.deserialize(job["cattr_1"]).to_h[:other_id]
         end
       end
     end
@@ -37,14 +50,14 @@ describe "Current attributes" do
     with_context("Myapp::Current", :user_id, 456) do
       with_context("Myapp::OtherCurrent", :other_id, 999) do
         cm.call(nil, job, nil, nil) do
-          assert_equal 123, job["cattr"][:user_id]
-          assert_equal 789, job["cattr_1"][:other_id]
+          assert_equal 123, Serializer.deserialize(job["cattr"]).to_h[:user_id]
+          assert_equal 789, Serializer.deserialize(job["cattr_1"]).to_h[:other_id]
         end
       end
     end
   end
 
-  it "loads" do
+  def test_loads
     cm = Sidekiq::CurrentAttributes::Load.new({
       "cattr" => "Myapp::Current",
       "cattr_1" => "Myapp::OtherCurrent"
@@ -60,12 +73,12 @@ describe "Current attributes" do
     # the Rails reloader is responsible for resetting Current after every unit of work
   end
 
-  it "persists with class argument" do
+  def test_persists_with_class_argument
     Sidekiq::CurrentAttributes.persist("Myapp::Current", @config)
     job_hash = {}
     with_context("Myapp::Current", :user_id, 16) do
       @config.client_middleware.invoke(nil, job_hash, nil, nil) do
-        assert_equal 16, job_hash["cattr"][:user_id]
+        assert_equal 16, Serializer.deserialize(job_hash["cattr"]).to_h[:user_id]
       end
     end
 
@@ -80,15 +93,53 @@ describe "Current attributes" do
     #   Sidekiq.server_middleware.clear
   end
 
-  it "persists with hash argument" do
+  def test_persists_with_hash_argument
     cattrs = [Myapp::Current, "Myapp::OtherCurrent"]
     Sidekiq::CurrentAttributes.persist(cattrs, @config)
     job_hash = {}
     with_context("Myapp::Current", :user_id, 16) do
       with_context("Myapp::OtherCurrent", :other_id, 17) do
         @config.client_middleware.invoke(nil, job_hash, nil, nil) do
-          assert_equal 16, job_hash["cattr"][:user_id]
-          assert_equal 17, job_hash["cattr_1"][:other_id]
+          assert_equal 16, Serializer.deserialize(job_hash["cattr"]).to_h[:user_id]
+          assert_equal 17, Serializer.deserialize(job_hash["cattr_1"]).to_h[:other_id]
+        end
+      end
+    end
+  end
+
+  def test_persists_after_perform_inline
+    Sidekiq::CurrentAttributes.persist("Myapp::Current", @config)
+    with_context("Myapp::Current", :user_id, 16) do
+      assert_equal 16, Myapp::Current.user_id
+      CurrentAttributesJob.perform_inline
+      assert_equal 16, Myapp::Current.user_id
+    end
+  end
+
+  def test_ignores_nonexistent_attributes
+    cm = Sidekiq::CurrentAttributes::Load.new({
+      "cattr" => "Myapp::Current"
+    })
+
+    job = {"cattr" => {"user_id" => 123, "non_existent" => 456}}
+    assert_nil Myapp::Current.user_id
+    cm.call(nil, job, nil) do
+      assert_equal 123, Myapp::Current.user_id
+    end
+  end
+
+  def test_doesnt_swallow_errors_raised_in_the_job
+    cm = Sidekiq::CurrentAttributes::Load.new({
+      "cattr" => "Myapp::Current"
+    })
+
+    job = {"cattr" => {"user_id" => 123}}
+    assert_raises do
+      first_time = true
+      cm.call(nil, job, nil) do
+        if first_time
+          first_time = false
+          raise nil.this_method_is_undefined
         end
       end
     end
@@ -100,7 +151,5 @@ describe "Current attributes" do
     constklass = strklass.constantize
     constklass.send(:"#{attr}=", value)
     yield
-  ensure
-    constklass.reset_all
   end
 end

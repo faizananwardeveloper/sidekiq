@@ -1,7 +1,9 @@
 # elements like %{queue} are variables and should not be translated
 fa:
+  LanguageName: فارسى
   Actions: اعمال
   AddToQueue: افزودن به صف
+  AddAllToQueue: افزودن همه به صف
   AreYouSure: آیا مطمعن هستید?
   AreYouSureDeleteJob: آیا شما مطمعن هستید از حذف این کار ؟
   AreYouSureDeleteQueue: ایا شما مطمعنید از حذف %{queue} ?
@@ -67,7 +69,7 @@ fa:
   Stop: توقف
   StopAll: توقف همه
   StopPolling: Stop Polling
-  TextDirection: 'rtl'
+  TextDirection: rtl
   Thread: رشته
   Threads: رشته ها
   ThreeMonths: ۳ ماه

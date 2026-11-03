@@ -2,6 +2,12 @@
 
 module Sidekiq
   module Paginator
+    TYPE_CACHE = {
+      "dead" => "zset",
+      "retry" => "zset",
+      "schedule" => "zset"
+    }
+
     def page(key, pageidx = 1, page_size = 25, opts = nil)
       current_page = (pageidx.to_i < 1) ? 1 : pageidx.to_i
       pageidx = current_page - 1
@@ -11,7 +17,15 @@ module Sidekiq
       ending = starting + page_size - 1
 
       Sidekiq.redis do |conn|
-        type = conn.type(key)
+        # horrible, think you can make this cleaner?
+        type = TYPE_CACHE[key]
+        if type
+        elsif key.start_with?("queue:")
+          type = TYPE_CACHE[key] = "list"
+        else
+          type = conn.type(key)
+          TYPE_CACHE[key] = type unless type == "none"
+        end
         rev = opts && opts[:reverse]
 
         case type
@@ -46,10 +60,18 @@ module Sidekiq
 
     def page_items(items, pageidx = 1, page_size = 25)
       current_page = (pageidx.to_i < 1) ? 1 : pageidx.to_i
+      # A negative page_size makes Array#[] return nil instead of a slice, which
+      # would crash callers iterating the result (e.g. the Web UI Busy page).
+      page_size = 0 if page_size < 0
       pageidx = current_page - 1
       starting = pageidx * page_size
       items = items.to_a
-      [current_page, items.size, items[starting, page_size]]
+      total_size = items.size
+      if starting > total_size
+        starting = 0
+        current_page = 1
+      end
+      [current_page, total_size, items[starting, page_size]]
     end
   end
 end

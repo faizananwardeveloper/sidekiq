@@ -2,16 +2,12 @@
 
 require_relative "helper"
 require "active_job"
-require "sidekiq/rails"
 require "sidekiq/api"
 
 describe "ActiveJob" do
   before do
-    @config = reset!
-    # need to force this since we aren't booting a Rails app
     ActiveJob::Base.queue_adapter = :sidekiq
-    ActiveJob::Base.logger = nil
-    ActiveJob::Base.send(:include, ::Sidekiq::Job::Options) unless ActiveJob::Base.respond_to?(:sidekiq_options)
+    @config = reset!
     @config[:backtrace_cleaner] = ->(backtrace) { Rails.backtrace_cleaner.clean(backtrace) }
   end
 
@@ -50,5 +46,15 @@ describe "ActiveJob" do
     assert_equal 5, job["backtrace"]
     # AJ's queue_as should take precedence over Sidekiq's queue option
     assert_equal "bar", job["queue"]
+  end
+
+  it "doesn't load ActiveJob::Base before Rails initialization is complete" do
+    # Rails sets ActiveJob::Base to an ActiveSupport::Logger by default,
+    # but we override config.active_job.logger in dummy/config/initializers/active_job.rb to a regular ::Logger.
+    # Check that that config has taken effect - if not, it implies that ActiveJob::Base got loaded
+    # before our initializer is complete.
+    app_dir = File.expand_path("./dummy", __dir__)
+    logger_class = IO.popen(["bin/rails", "runner", "puts ActiveJob::Base.logger.class"], chdir: app_dir).read.chomp
+    assert_equal "Logger", logger_class
   end
 end

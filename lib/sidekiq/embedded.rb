@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "sidekiq/component"
 require "sidekiq/launcher"
 require "sidekiq/metrics/tracking"
@@ -32,6 +34,7 @@ module Sidekiq
     private
 
     def housekeeping
+      @config[:tag] ||= default_tag
       logger.info "Running in #{RUBY_DESCRIPTION}"
       logger.info Sidekiq::LICENSE
       logger.info "Upgrade to Sidekiq Pro for more features and support: https://sidekiq.org" unless defined?(::Sidekiq::Pro)
@@ -40,7 +43,7 @@ module Sidekiq
       # fire startup and start multithreading.
       info = config.redis_info
       ver = Gem::Version.new(info["redis_version"])
-      raise "You are connecting to Redis #{ver}, Sidekiq requires Redis 6.2.0 or greater" if ver < Gem::Version.new("6.2.0")
+      raise "You are connected to Redis #{ver}, Sidekiq requires Redis 7.0.0 or greater" if ver < Gem::Version.new("7.0.0")
 
       maxmemory_policy = info["maxmemory_policy"]
       if maxmemory_policy != "noeviction"

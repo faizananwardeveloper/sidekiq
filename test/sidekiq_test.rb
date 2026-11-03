@@ -7,6 +7,11 @@ describe Sidekiq do
     @config = reset!
   end
 
+  it "has a gem version" do
+    # .to_s necessary in Ruby < 3.1
+    assert_equal Sidekiq.gem_version.to_s, Sidekiq::VERSION
+  end
+
   describe "json processing" do
     it "handles json" do
       assert_equal({"foo" => "bar"}, Sidekiq.load_json("{\"foo\":\"bar\"}"))
@@ -103,6 +108,78 @@ describe Sidekiq do
     it "calls the INFO command which returns at least redis_version" do
       output = @config.redis_info
       assert_includes output.keys, "redis_version"
+    end
+  end
+
+  describe ".testing!" do
+    it "rejects an unknown mode" do
+      err = assert_raises(RuntimeError) { Sidekiq.testing!(:bogus) }
+      assert_match(/Unknown testing mode: bogus/, err.message)
+    end
+  end
+
+  describe ".strict_args!" do
+    it "updates Sidekiq::Config::DEFAULTS[:on_complex_arguments]" do
+      original = Sidekiq::Config::DEFAULTS[:on_complex_arguments]
+
+      Sidekiq.strict_args!(false)
+      assert_equal false, Sidekiq::Config::DEFAULTS[:on_complex_arguments]
+
+      Sidekiq.strict_args!(:warn)
+      assert_equal :warn, Sidekiq::Config::DEFAULTS[:on_complex_arguments]
+
+      Sidekiq.strict_args!
+      assert_equal :raise, Sidekiq::Config::DEFAULTS[:on_complex_arguments]
+    ensure
+      Sidekiq::Config::DEFAULTS[:on_complex_arguments] = original
+    end
+  end
+
+  describe "ractor support" do
+    # Ractor#value replaced Ractor#take in Ruby 3.5
+    def ractor_result(r)
+      r.respond_to?(:value) ? r.value : r.take
+    end
+
+    it "allows Redis access within a Ractor" do
+      cfg = Sidekiq::Config.new
+      pool = cfg.redis_pool
+      pool.with { |c| c.ping }
+
+      r = Ractor.new(cfg.instance_variable_get(:@redis_config)) do |cfgh|
+        po = Sidekiq::RedisConnection.create(cfgh)
+        po.with { |c| c.ping }
+      end
+      val = ractor_result(r)
+      assert_equal "PONG", val
+    end
+
+    it "allows sharing a pool with a Ractor" do
+      skip "ConnectionPool holds a Proc, Mutexes and sockets so it can't be shared across Ractors"
+      pool = Sidekiq::Config.new.redis_pool
+      r = Ractor.new(pool) do |p|
+        p.with { |c| c.ping }
+      end
+      val = ractor_result(r)
+      assert_equal "PONG", val
+    end
+  end
+
+  describe "edition predicates" do
+    it ".pro? / .ent? reflect whether the matching constant is defined" do
+      refute defined?(Sidekiq::Pro)
+      refute defined?(Sidekiq::Enterprise)
+      assert_nil Sidekiq.pro?
+      assert_nil Sidekiq.ent?
+
+      ::Sidekiq.const_set(:Pro, Module.new)
+      assert Sidekiq.pro?
+
+      ::Sidekiq.const_set(:Enterprise, Module.new)
+      assert Sidekiq.ent?
+    ensure
+      ::Sidekiq.send(:remove_const, :Pro) if defined?(Sidekiq::Pro)
+      ::Sidekiq.send(:remove_const, :Enterprise) if defined?(Sidekiq::Enterprise)
     end
   end
 end

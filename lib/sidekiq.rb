@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "sidekiq/version"
-fail "Sidekiq #{Sidekiq::VERSION} does not support Ruby versions below 2.7.0." if RUBY_PLATFORM != "java" && Gem::Version.new(RUBY_VERSION) < Gem::Version.new("2.7.0")
+fail "Sidekiq #{Sidekiq::VERSION} does not support Ruby versions below 3.2.0." if RUBY_PLATFORM != "java" && Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.2.0")
 
 begin
   require "sidekiq-ent/version"
@@ -29,9 +29,11 @@ end
 
 require "sidekiq/config"
 require "sidekiq/logger"
+require "sidekiq/loader"
 require "sidekiq/client"
 require "sidekiq/transaction_aware_client"
 require "sidekiq/job"
+require "sidekiq/iterable_job"
 require "sidekiq/worker_compatibility_alias"
 require "sidekiq/redis_client_adapter"
 
@@ -43,6 +45,13 @@ module Sidekiq
 
   def self.❨╯°□°❩╯︵┻━┻
     puts "Take a deep breath and count to ten..."
+  end
+
+  def self.testing!(mode = :fake, &block)
+    raise "Unknown testing mode: #{mode}" unless %i[fake disable inline].include?(mode)
+
+    require "sidekiq/test_api"
+    Sidekiq::Testing.__set_test_mode(mode, &block)
   end
 
   def self.server?
@@ -93,6 +102,10 @@ module Sidekiq
     default_configuration.logger
   end
 
+  def self.loader
+    @loader ||= Loader.new
+  end
+
   def self.configure_server(&block)
     (@config_blocks ||= []) << block
     yield default_configuration if server?
@@ -101,18 +114,19 @@ module Sidekiq
   def self.freeze!
     @frozen = true
     @config_blocks = nil
+    default_configuration.freeze!
   end
 
   # Creates a Sidekiq::Config instance that is more tuned for embedding
   # within an arbitrary Ruby process. Notably it reduces concurrency by
   # default so there is less contention for CPU time with other threads.
   #
-  #   inst = Sidekiq.configure_embed do |config|
+  #   instance = Sidekiq.configure_embed do |config|
   #     config.queues = %w[critical default low]
   #   end
-  #   inst.run
+  #   instance.run
   #   sleep 10
-  #   inst.terminate
+  #   instance.stop
   #
   # NB: it is really easy to overload a Ruby process with threads due to the GIL.
   # I do not recommend setting concurrency higher than 2-3.

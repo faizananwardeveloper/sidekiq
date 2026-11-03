@@ -4,6 +4,179 @@
 
 Please see [sidekiq.org](https://sidekiq.org/) for more details and how to buy.
 
+HEAD
+---------
+
+- Throttle batch-died cleanup [#7080]
+
+8.1.6
+---------
+
+- Ephemeral (discarded if they fail all retries, `dead: false`) jobs were not discarded if they behaved as poison pills, leading to job accumulation in Redis [#7063]
+- Tune the bulk scheduled job push within batches to avoid SLOWLOG entries
+
+8.1.5
+---------
+
+- Coerce batch created_at to integer [#7049]
+- Fix incorrect batch total job count when using autoflush, thx Teddy!
+
+8.1.4
+---------
+
+- Garbage collect the `batch-died` data structure in Redis [#7033]
+- Enforce a floor of 30 seconds on Batch linger to prevent race conditions when
+  firing nested callbacks
+
+8.1.3
+---------
+
+- Fix autoflush crash when mixing scheduled and immediate jobs [#6991]
+
+8.1.2
+---------
+
+- Add new `autoflush` mode to Batches to flush every N jobs. [#6967]
+  The `jobs` block collects all jobs for the Batch and pushes them
+  all atomically at the same time but this can use a massive amount of
+  memory if your batch has millions of jobs. Enabling autoflush will
+  push every N collected jobs but will lose the atomicity.
+```ruby
+b = Sidekiq::Batch.new
+b.autoflush = 1000 # flush to Redis every 1000 jobs
+b.jobs do
+  # push tons of jobs
+end
+```
+
+8.1.1
+---------
+
+- Interrupted iterable job should not trigger :complete callback [#6889]
+- Support for `kiq`
+
+8.1.0
+---------
+
+- Support batch tagging and search via API or within the Web UI [#6860]
+  **Batch tagging requires Redis 7.4 or Valkey 9.0**
+```ruby
+b = Sidekiq::Batch.new
+b.tags = %w(customer:12345 france)
+
+require "sidekiq/api"
+Sidekiq::BatchSet.new.scan_tags("12345") do |bid|
+  st = Sidekiq::Batch::Status.new(bid)
+end
+```
+- Remove non-idempotent operation leading to duplicate batch callbacks [#6852]
+- Adjust metrics timing calculations to be more accurate
+
+8.0.3
+---------
+
+- Warn if passing a single value as options in `batch.on(event, target, options)`.
+  Callback options were always meant to be a Hash but the API never validated it.
+  This will raise an `ArgumentError` in Pro 9.0. [#6789]
+```ruby
+batch.on(:success, MyCallback, 1234) # bad
+batch.on(:success, MyCallback, "document_id" => 1234) # good
+```
+
+8.0.2
+---------
+
+- Statsd middleware now sends a new `sidekiq.jobs.perform_dist`
+  distribution metric. This type is proprietary to Datadog but provides
+  much better statistical visibility into job timing across a cluster.
+  You can disable this metric type with:
+```ruby
+Sidekiq.configure_server { |c| c[:use_datadog_extensions] = false }
+```
+- Batch success now sends `sidekiq.batch.duration` and `sidekiq.batch.duration_dist`
+  metrics for monitoring the total time to execute a batch. You can add tags for
+  visibility and filtering within the UI when defining your `success` callback:
+```ruby
+batch.on(:success, ..., {tags: ["batchtype:OrderProcess"]})
+```
+- Statsd middleware no longer sends the `sidekiq.jobs.perform` timing
+  metric when a job fails since failure can happen for so many reasons;
+  timing data is typically not useful for detecting or fixing failures.
+- Poison pill logging now accounts for wrapped class names [#6756]
+
+8.0.1
+---------
+
+- Standardize batch callback timestamps as integer millis [#6644]
+
+8.0.0
+---------
+
+- Please read the **[upgrade notes](https://github.com/sidekiq/sidekiq/blob/main/docs/Pro-8.0-Upgrade.md)** before upgrading major versions.
+  The Sidekiq::Batch data model has changed and requires you to run the latest 7.3.x to ensure data compatibility.
+- **BREAKING** All Pro/Enterprise Statsd metrics are now prefixed with `sidekiq.`. [#6337]
+  Customers are advised to remove `namespace: 'sidekiq'` or similar from their Statsd configration.
+- **BREAKING** Batch's `failure_info` structure and API have been replaced
+  with `failed_jids` in order to reduce duplicate data within Redis. [#6580]
+- Batch's callback tracking has been refactored to use modern Redis commands and structures.
+- Sidekiq::Batch's `created_at` is now stored as Integer milliseconds rather than a Float.
+- Sidekiq::Web internal refactoring [#6532]
+- Atomic scheduler performance tuning [#6609]
+- Discard poison pill jobs with `dead: false` [#6628]
+
+7.3.7
+---------
+
+- Fix iterable job interruption within batch triggering premature :complete callback [#6889]
+- Fix super_fetch orphan recovery on Dragonfly
+
+7.3.6
+---------
+
+- Batch data model forward compatibility [#6594]
+  Make sure you update to this version and run it for several weeks before upgrading to 8.0.
+  8.0 will not work with batch data created before this version.
+- Fix batch pagination [#6577]
+- Fix super_fetch script when running on DragonflyDB
+
+7.3.5
+---------
+
+- Fix pause/unpause [#6574]
+- Relax metric connection pool sizing [#6560]
+
+7.3.4
+---------
+
+- Add new `distribution` and `distribution_time` metrics [#6534]
+- `time` metrics no longer hold a Statsd connection while timing the block
+- Fix queue pause affecting all applications using the same Redis instance,
+  even if using different DB indexes. [#6528]
+- Fix broken filter links on Batch details page
+- Use backported APIs for Web extension
+
+7.3.3
+---------
+
+- Don't issue Batch::Empty jobs when reopening but adding zero jobs [#6489]
+
+7.3.2
+---------
+
+- Fix missing `success_at` in batch callbacks [#6463]
+- Add `Sidekiq::Pro.gem_version` API
+
+7.3.1
+---------
+
+- Adjust Batch CSS for better accessibility [#6387]
+- Adjust reliable scheduler for compatibility with DragonflyDB [dragonflydb/dragonfly#2442]
+
+7.3.0
+---------
+
+- Remove `base64` gem dependency.
+
 7.2.1
 ---------
 

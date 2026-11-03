@@ -4,7 +4,6 @@ require_relative "helper"
 require "sidekiq/scheduled"
 require "sidekiq/job_retry"
 require "sidekiq/api"
-require "sidekiq/capsule"
 require "active_support/core_ext/numeric/time"
 
 class SomeJob
@@ -86,7 +85,7 @@ describe Sidekiq::JobRetry do
     end
 
     def handler
-      @handler ||= Sidekiq::JobRetry.new(@config.default_capsule)
+      @handler ||= Sidekiq::JobRetry.new(@config)
     end
 
     def jobstr(options = {})
@@ -95,6 +94,18 @@ describe Sidekiq::JobRetry do
 
     def job
       Sidekiq::RetrySet.new.first
+    end
+
+    describe "#time_for" do
+      it "converts integer millisecond timestamps with sub-second precision" do
+        ms = 1_700_000_000_500
+        assert_in_delta 1_700_000_000.5, handler.send(:time_for, ms).to_f, 0.0001
+      end
+
+      it "passes through legacy float (epoch seconds) timestamps" do
+        secs = 1_700_000_000.5
+        assert_in_delta secs, handler.send(:time_for, secs).to_f, 0.0001
+      end
     end
 
     it "retries with a nil worker" do
@@ -135,7 +146,7 @@ describe Sidekiq::JobRetry do
       assert_equal 0, Sidekiq::DeadSet.new.size
 
       assert_raises RuntimeError do
-        handler.local(worker, jobstr("retry_for" => 60, "retry_count" => 0, "failed_at" => (Time.now.to_f - 61)), "default") do
+        handler.local(worker, jobstr("retry_for" => 60, "retry_count" => 0, "failed_at" => (Time.now.to_i * 1000) - 61000), "default") do
           raise "kerblammo!"
         end
       end
@@ -145,6 +156,22 @@ describe Sidekiq::JobRetry do
       RetryForJob.perform_async
       rfj = Sidekiq::Queue.new.first
       assert_equal 172800, rfj["retry_for"]
+    end
+
+    it "retry_for ignores max_retries setting" do
+      # Set a low max_retries that would normally exhaust retries
+      @config[:max_retries] = 2
+
+      # Job has retry_for set and retry_count exceeds max_retries,
+      # but retry_for duration has NOT expired - should still retry
+      assert_raises RuntimeError do
+        handler.local(worker, jobstr("retry_for" => 3600, "retry_count" => 5, "failed_at" => Time.now.to_i * 1000), "default") do
+          raise "kerblammo!"
+        end
+      end
+      # Job should be in retry set, not dead set (retry_for takes precedence)
+      assert_equal 1, Sidekiq::RetrySet.new.size
+      assert_equal 0, Sidekiq::DeadSet.new.size
     end
 
     it "allows 0 retry => no retry and dead queue" do
@@ -311,7 +338,7 @@ describe Sidekiq::JobRetry do
     end
 
     it "handles a recurring failed message" do
-      now = Time.now.to_f
+      now = Time.now.to_i * 1000
       msg = {"queue" => "default", "error_message" => "kerblammo!", "error_class" => "RuntimeError", "failed_at" => now, "retry_count" => 10}
       assert_raises RuntimeError do
         handler.local(worker, jobstr(msg), "default") do
@@ -333,7 +360,7 @@ describe Sidekiq::JobRetry do
       assert_equal 0, q.size
       assert_equal 0, rs.size
       assert_equal 0, ds.size
-      now = Time.now.to_f
+      now = Time.now.to_i * 1000
       msg = {"queue" => "default", "error_message" => "kerblammo!", "error_class" => "RuntimeError", "failed_at" => now, "retry_count" => 25}
       assert_raises RuntimeError do
         handler.local(worker, jobstr(msg), "default") do
@@ -405,10 +432,26 @@ describe Sidekiq::JobRetry do
           output, "Log entry missing for sidekiq_retry_in")
       end
 
+      it "calls death handlers even for :discard" do
+        @job = nil
+        @config.death_handlers << ->(job, exception) { @job = job }
+
+        ds = Sidekiq::DeadSet.new
+        assert_equal 0, ds.size
+        assert_raises Sidekiq::JobRetry::Handled do
+          handler.local(CustomJobWithException, jobstr({"class" => "CustomJobWithException"}), "default") do
+            raise Interrupt
+          end
+        end
+        assert_equal 0, ds.size
+        assert @job
+        assert @job["discarded_at"]
+      end
+
       it "kills when configured on special exceptions" do
         ds = Sidekiq::DeadSet.new
         assert_equal 0, ds.size
-        assert_raises Sidekiq::JobRetry::Skip do
+        assert_raises Sidekiq::JobRetry::Handled do
           handler.local(CustomJobWithException, jobstr({"class" => "CustomJobWithException"}), "default") do
             raise "oops"
           end
@@ -417,6 +460,12 @@ describe Sidekiq::JobRetry do
       end
 
       it "supports wrapped jobs" do
+        strat, count = handler.__send__(:delay_for, Sidekiq::ActiveJob::Wrapper, 2, StandardError.new, {"wrapped" => ActiveJobRetry.to_s})
+        assert_equal :default, strat
+        assert_equal 10, count
+      end
+
+      it "supports old wrapped jobs" do
         strat, count = handler.__send__(:delay_for, ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper, 2, StandardError.new, {"wrapped" => ActiveJobRetry.to_s})
         assert_equal :default, strat
         assert_equal 10, count

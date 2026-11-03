@@ -1,7 +1,9 @@
 # elements like %{queue} are variables and should not be translated
 ar:
+  LanguageName: العربية
   Actions: إجراءات
   AddToQueue: إضافة إلى الرتل
+  AddAllToQueue: إضافة الكل إلى الرتل
   AreYouSure: هل انت متأكد؟
   AreYouSureDeleteJob: هل أنت متأكد من حذف الوظيفة؟
   AreYouSureDeleteQueue: هل أنت متأكد من حذف الرتل %{queue}؟
@@ -72,7 +74,7 @@ ar:
   Stop: إيقاف
   StopAll: إيقاف الكل
   StopPolling: إيقاف الاستعلامات
-  TextDirection: 'rtl'
+  TextDirection: rtl
   Thread: نيسب
   Threads: نياسب
   ThreeMonths: ثلاثة أشهر

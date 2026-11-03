@@ -1,24 +1,106 @@
 # frozen_string_literal: true
 
 require "uri"
-require "set"
-require "yaml"
-require "cgi"
+require "cgi/escape"
 
 module Sidekiq
-  # This is not a public API
+  # These methods are available to pages within the Web UI and UI extensions.
+  # They are not public APIs for applications to use.
   module WebHelpers
+    def store_name
+      hash = redis_info
+      return "Dragonfly" if hash.has_key?("dragonfly_version")
+      return "Valkey" if hash.has_key?("valkey_version")
+      "Redis"
+    end
+
+    def store_version
+      hash = redis_info
+      return hash["dragonfly_version"] if hash.has_key?("dragonfly_version")
+      return hash["valkey_version"] if hash.has_key?("valkey_version")
+      hash["redis_version"]
+    end
+
+    def style_tag(location, **kwargs)
+      global = location.match?(/:\/\//)
+      location = root_path + location if !global && !location.start_with?(root_path)
+      attrs = {
+        type: "text/css",
+        media: "screen",
+        rel: "stylesheet",
+        nonce: csp_nonce,
+        href: location
+      }
+      add_to_head do
+        html_tag(:link, attrs.merge(kwargs))
+      end
+    end
+
+    def script_tag(location, **kwargs)
+      global = location.match?(/:\/\//)
+      location = root_path + location if !global && !location.start_with?(root_path)
+      attrs = {
+        type: "text/javascript",
+        nonce: csp_nonce,
+        src: location
+      }
+      html_tag(:script, attrs.merge(kwargs)) {}
+    end
+
+    # NB: keys and values are not escaped; do not allow user input
+    # in the attributes
+    private def html_tag(tagname, attrs)
+      s = "<#{tagname}"
+      attrs.each_pair do |k, v|
+        next unless v
+        s << " #{k}=\"#{v}\""
+      end
+      if block_given?
+        s << ">"
+        yield s
+        s << "</#{tagname}>"
+      else
+        s << " />"
+      end
+      s
+    end
+
     def strings(lang)
-      @strings ||= {}
+      @@strings ||= {}
 
       # Allow sidekiq-web extensions to add locale paths
       # so extensions can be localized
-      @strings[lang] ||= settings.locales.each_with_object({}) do |path, global|
+      @@strings[lang] ||= config.locales.each_with_object({}) do |path, global|
         find_locale_files(lang).each do |file|
-          strs = YAML.safe_load(File.read(file))
+          strs = parse_yaml(file)
           global.merge!(strs[lang])
         end
       end
+    end
+
+    def parse_yaml(path)
+      locale = nil
+      map = {}
+      IO.readlines(path, chomp: true, encoding: "UTF-8").each do |line|
+        case line
+        when /\A\s*\#.*/
+          # line comment
+        when !locale && /\A([a-zA-Z\-_]+):/
+          locale = $1
+          map[locale] = {}
+        when /\A\s+(\w+):\s+(.+)\z/
+          # A few values have double quotes to include special characters in YAML.
+          # Strip them off manually as our greedy match will include them.
+          key = $1
+          s = $2
+          s = s[1..] if s[0] == "\""
+          s = s[0..-2] if s[-1] == "\""
+          map[locale][key] = s
+        else
+          raise ArgumentError, "unable to parse #{path}: #{line}"
+        end
+      end
+      map
     end
 
     def to_json(x)
@@ -34,23 +116,27 @@ module Sidekiq
     end
 
     def clear_caches
-      @strings = nil
-      @locale_files = nil
-      @available_locales = nil
+      @@strings = nil
+      @@locale_files = nil
+      @@available_locales = nil
     end
 
     def locale_files
-      @locale_files ||= settings.locales.flat_map { |path|
+      @@locale_files ||= config.locales.flat_map { |path|
         Dir["#{path}/*.yml"]
       }
     end
 
     def available_locales
-      @available_locales ||= locale_files.map { |path| File.basename(path, ".yml") }.uniq
+      @@available_locales ||= Set.new(locale_files.map { |path| File.basename(path, ".yml") })
     end
 
     def find_locale_files(lang)
       locale_files.select { |file| file =~ /\/#{lang}\.yml$/ }
+    end
+
+    def language_name(locale)
+      strings(locale).fetch("LanguageName", locale)
     end
 
     def search(jobset, substr)
@@ -60,21 +146,22 @@ module Sidekiq
       resultset
     end
 
-    def filtering(which)
-      erb(:filtering, locals: {which: which})
+    def filtering(which, placeholder_key: "AnyJobContent", label_key: "Filter")
+      erb(:filtering, locals: {which:, placeholder_key:, label_key:})
     end
 
-    def filter_link(jid, within = "retries")
+    def filter_link(str, within = "retries")
+      hstr = h(str)
       if within.nil?
-        ::Rack::Utils.escape_html(jid)
+        hstr
       else
-        "<a href='#{root_path}filter/#{within}?substr=#{jid}'>#{::Rack::Utils.escape_html(jid)}</a>"
+        "<a href='#{root_path}#{within}?substr=#{CGI.escape(str.to_s)}'>#{hstr}</a>"
       end
     end
 
     def display_tags(job, within = "retries")
       job.tags.map { |tag|
-        "<span class='label label-info jobtag'>#{filter_link(tag, within)}</span>"
+        "<span class='label label-info jobtag jobtag-#{h(tag)}'>#{filter_link(tag, within)}</span>"
       }.join(" ")
     end
 
@@ -103,10 +190,13 @@ module Sidekiq
       text_direction == "rtl"
     end
 
-    # See https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.4
+    # See https://www.rfc-editor.org/rfc/rfc9110.html#section-12.5.4
+    # Returns an array of language tags ordered by their quality value
+    #
+    # Inspiration taken from https://github.com/iain/http_accept_language/blob/master/lib/http_accept_language/parser.rb
     def user_preferred_languages
       languages = env["HTTP_ACCEPT_LANGUAGE"]
-      languages.to_s.downcase.gsub(/\s+/, "").split(",").map { |language|
+      languages.to_s.gsub(/\s+/, "").split(",").map { |language|
         locale, quality = language.split(";q=", 2)
         locale = nil if locale == "*" # Ignore wildcards
         quality = quality ? quality.to_f : 1.0
@@ -118,23 +208,30 @@ module Sidekiq
 
     # Given an Accept-Language header like "fr-FR,fr;q=0.8,en-US;q=0.6,en;q=0.4,ru;q=0.2"
     # this method will try to best match the available locales to the user's preferred languages.
-    #
-    # Inspiration taken from https://github.com/iain/http_accept_language/blob/master/lib/http_accept_language/parser.rb
     def locale
       # session[:locale] is set via the locale selector from the footer
-      # defined?(session) && session are used to avoid exceptions when running tests
-      return session[:locale].to_s if defined?(session) && session&.[](:locale)
+      @locale ||= if (l = session&.fetch(:locale, nil)) && available_locales.include?(l)
+        l
+      else
+        matched_locale = nil
+        # Attempt to find a case-insensitive exact match first
+        user_preferred_languages.each do |preferred|
+          # We only care about the language and primary subtag
+          # "en-GB-oxendict" becomes "en-GB"
+          language_tag = preferred.split("-")[0..1].join("-")
+          matched_locale = available_locales.find { |available_locale| available_locale.casecmp?(language_tag) }
+          break if matched_locale
+        end
 
-      @locale ||= begin
-        matched_locale = user_preferred_languages.map { |preferred|
-          preferred_language = preferred.split("-", 2).first
+        return matched_locale if matched_locale
 
-          lang_group = available_locales.select { |available|
-            preferred_language == available.split("-", 2).first
-          }
-
-          lang_group.find { |lang| lang == preferred } || lang_group.min_by(&:length)
-        }.compact.first
+        # Find the first base language match
+        # "en-US,es-MX;q=0.9" matches "en"
+        user_preferred_languages.each do |preferred|
+          base_language = preferred.split("-", 2).first
+          matched_locale = available_locales.find { |available_locale| available_locale.casecmp?(base_language) }
+          break if matched_locale
+        end
 
         matched_locale || "en"
       end
@@ -142,7 +239,8 @@ module Sidekiq
 
     # sidekiq/sidekiq#3243
     def unfiltered?
-      yield unless env["PATH_INFO"].start_with?("/filter/")
+      s = url_params("substr")
+      yield unless s && s.size > 0
     end
 
     def get_locale
@@ -159,7 +257,7 @@ module Sidekiq
     end
 
     def sort_direction_label
-      (params[:direction] == "asc") ? "&uarr;" : "&darr;"
+      (url_params("direction") == "asc") ? "&uarr;" : "&darr;"
     end
 
     def workset
@@ -183,14 +281,6 @@ module Sidekiq
       end
     end
 
-    def busy_weights(capsule_weights)
-      # backwards compat with 7.0.0, remove in 7.1
-      cw = [capsule_weights].flatten
-      cw.map { |hash|
-        hash.map { |name, weight| (weight > 0) ? +name << ": " << weight.to_s : name }.join(", ")
-      }.join("; ")
-    end
-
     def stats
       @stats ||= Sidekiq::Stats.new
     end
@@ -202,7 +292,7 @@ module Sidekiq
     end
 
     def redis_info
-      Sidekiq.default_configuration.redis_info
+      @info ||= Sidekiq.default_configuration.redis_info
     end
 
     def root_path
@@ -222,26 +312,37 @@ module Sidekiq
       %(<time class="ltr" dir="ltr" title="#{stamp}" datetime="#{stamp}">#{time}</time>)
     end
 
+    def queue_names_by_capsule(pro)
+      cap = pro.capsules
+      if cap
+        cap.map { |k, v| v["weights"].keys.join(", ") }.join("; ")
+      else
+        # DEPRECATED Backwards compatibility with older processes.
+        # 'capsules' element added in v8.0.9
+        pro.queues.join(", ")
+      end
+    end
+
     def job_params(job, score)
       "#{score}-#{job["jid"]}"
     end
 
-    def parse_params(params)
-      score, jid = params.split("-", 2)
+    def parse_key(key)
+      score, jid = key.split("-", 2)
       [score.to_f, jid]
     end
 
-    SAFE_QPARAMS = %w[page direction]
+    SAFE_QPARAMS = %w[page direction only]
 
     # Merge options with current params, filter safe params, and stringify to query string
     def qparams(options)
       stringified_options = options.transform_keys(&:to_s)
 
-      to_query_string(params.merge(stringified_options))
+      to_query_string(request.params.merge(stringified_options))
     end
 
-    def to_query_string(params)
-      params.map { |key, value|
+    def to_query_string(hash)
+      hash.map { |key, value|
         SAFE_QPARAMS.include?(key) ? "#{key}=#{CGI.escape(value.to_s)}" : next
       }.compact.join("&")
     end
@@ -264,7 +365,11 @@ module Sidekiq
     end
 
     def csrf_tag
-      "<input type='hidden' name='authenticity_token' value='#{env[:csrf_token]}'/>"
+      ""
+    end
+
+    def csp_nonce
+      env[:csp_nonce]
     end
 
     def to_display(arg)
@@ -300,7 +405,7 @@ module Sidekiq
       elsif rss_kb < 10_000_000
         "#{number_with_delimiter((rss_kb / 1024.0).to_i)} MB"
       else
-        "#{number_with_delimiter((rss_kb / (1024.0 * 1024.0)), precision: 1)} GB"
+        "#{number_with_delimiter(rss_kb / (1024.0 * 1024.0), precision: 1)} GB"
       end
     end
 
@@ -310,7 +415,7 @@ module Sidekiq
     end
 
     def h(text)
-      ::Rack::Utils.escape_html(text)
+      ::CGI.escapeHTML(text.to_s)
     rescue ArgumentError => e
       raise unless e.message.eql?("invalid byte sequence in UTF-8")
       text.encode!("UTF-16", "UTF-8", invalid: :replace, replace: "").encode!("UTF-8", "UTF-16")
@@ -333,6 +438,19 @@ module Sidekiq
       environment = Sidekiq.default_configuration[:environment] || ENV["APP_ENV"] || ENV["RAILS_ENV"] || ENV["RACK_ENV"] || "development"
 
       "[#{environment.upcase}] " unless environment == "production"
+    end
+
+    def active_tab?(url)
+      (url == "") ? current_path == url : current_path.start_with?(url)
+    end
+
+    # Browser tab title, e.g. "Busy (5/25) | Sidekiq". Views may set @page_title
+    # to override the default, which is the label of the active nav tab.
+    # The dashboard is the home page and gets the bare product name.
+    def page_title
+      tab = config.tabs.find { |_, url| active_tab?(url) }
+      title = @page_title || (t(tab[0]) if tab && tab[1] != "")
+      [title, Sidekiq::NAME].compact.join(" | ")
     end
 
     def product_version
@@ -364,6 +482,15 @@ module Sidekiq
       elsif params["add_to_queue"]
         job.add_to_queue
       end
+    end
+
+    def url_count(param_name: "count", default_count: 25)
+      p = url_params(param_name)
+      if p
+        c = p.to_i
+        return c if c > 0 && c < 1000
+      end
+      default_count
     end
   end
 end

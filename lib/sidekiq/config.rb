@@ -1,6 +1,6 @@
-require "forwardable"
+# frozen_string_literal: true
 
-require "set"
+require "forwardable"
 require "sidekiq/redis_connection"
 
 module Sidekiq
@@ -17,12 +17,16 @@ module Sidekiq
       poll_interval_average: nil,
       average_scheduled_poll_interval: 5,
       on_complex_arguments: :raise,
+      # if the Iterable job runs longer than this value (in seconds), then the job
+      # will be interrupted after the current iteration and re-enqueued at the back of the queue
+      max_iteration_runtime: nil,
       error_handlers: [],
       death_handlers: [],
       lifecycle_events: {
         startup: [],
         quiet: [],
         shutdown: [],
+        exit: [],
         # triggers when we fire the first heartbeat on startup OR repairing a network partition
         heartbeat: [],
         # triggers on EVERY heartbeat call, every 10 seconds
@@ -31,16 +35,28 @@ module Sidekiq
       dead_max_jobs: 10_000,
       dead_timeout_in_seconds: 180 * 24 * 60 * 60, # 6 months
       reloader: proc { |&block| block.call },
-      backtrace_cleaner: ->(backtrace) { backtrace }
+      backtrace_cleaner: ->(backtrace) { backtrace },
+      logged_job_attributes: ["bid", "tags"],
+      redis_idle_timeout: nil
     }
 
     ERROR_HANDLER = ->(ex, ctx, cfg = Sidekiq.default_configuration) {
-      l = cfg.logger
-      l.warn(Sidekiq.dump_json(ctx)) unless ctx.empty?
-      l.warn("#{ex.class.name}: #{ex.message}")
-      unless ex.backtrace.nil?
-        backtrace = cfg[:backtrace_cleaner].call(ex.backtrace)
-        l.warn(backtrace.join("\n"))
+      Sidekiq::Context.with(ctx) do
+        dev = cfg[:environment] == "development"
+        fancy = dev && $stdout.tty? # 🎩
+        # Weird logic here but we want to show the backtrace in local
+        # development or if verbose logging is enabled.
+        #
+        # `full_message` contains the error class, message and backtrace
+        # `detailed_message` contains the error class and message
+        #
+        # Absolutely terrible API names. Not useful at all to have two
+        # methods with similar but obscure names.
+        if dev || cfg.logger.debug?
+          cfg.logger.info { ex.full_message(highlight: fancy) }
+        else
+          cfg.logger.info { ex.detailed_message(highlight: fancy) }
+        end
       end
     }
 
@@ -49,11 +65,20 @@ module Sidekiq
       @options[:error_handlers] << ERROR_HANDLER if @options[:error_handlers].empty?
       @directory = {}
       @redis_config = {}
+      @redis = nil
+      @redis_origin = nil
       @capsules = {}
     end
 
-    def_delegators :@options, :[], :[]=, :fetch, :key?, :has_key?, :merge!
+    def_delegators :@options, :[], :[]=, :fetch, :key?, :has_key?, :merge!, :dig
     attr_reader :capsules
+    attr_accessor :thread_priority
+
+    def inspect
+      "#<#{self.class.name} @options=#{
+        @options.except(:lifecycle_events, :reloader, :death_handlers, :error_handlers).inspect
+      }>"
+    end
 
     def to_json(*)
       Sidekiq.dump_json(@options)
@@ -120,17 +145,44 @@ module Sidekiq
 
     # All capsules must use the same Redis configuration
     def redis=(hash)
+      if @redis
+        raise <<~MESSAGE
+          An attempt was made to configure Sidekiq Redis with `config.redis = ...` after the
+          connection pool was already created. This might come from another initializer,
+          or a background process started by a gem.
+
+          The pool was created from:
+            #{@redis_origin.join("\n  ")}
+
+        MESSAGE
+      end
+
       @redis_config = @redis_config.merge(hash)
+    end
+
+    def reap_idle_redis_connections(timeout = 60)
+      self[:redis_idle_timeout] = timeout
     end
 
     def redis_pool
       Thread.current[:sidekiq_redis_pool] || Thread.current[:sidekiq_capsule]&.redis_pool || local_redis_pool
     end
 
-    private def local_redis_pool
+    def local_redis_pool
       # this is our internal client/housekeeping pool. each capsule has its
       # own pool for executing threads.
-      @redis ||= new_redis_pool(10, "internal")
+      return @redis if @redis
+
+      @redis_origin = pool_origin
+      @redis = new_redis_pool(10, "internal")
+    end
+
+    # Remember which code created the pool, so a future error message can possibly reference it
+    def pool_origin
+      lib_dir = File.expand_path("..", __dir__)
+      frames = caller_locations(1, 30)
+      app = frames.reject { |loc| loc.path.start_with?(lib_dir) }
+      (app.empty? ? frames : app).first(5)
     end
 
     def new_redis_pool(size, name = "unset")
@@ -179,7 +231,13 @@ module Sidekiq
 
     # register global singletons which can be accessed elsewhere
     def register(name, instance)
-      @directory[name] = instance
+      # logger.debug("register[#{name}] = #{instance}")
+      # Sidekiq Enterprise lazy registers a few services so we
+      # can't lock down this hash completely.
+      hash = @directory.dup
+      hash[name] = instance
+      @directory = hash.freeze
+      instance
     end
 
     # find a singleton
@@ -187,8 +245,14 @@ module Sidekiq
       # JNDI is just a fancy name for a hash lookup
       @directory.fetch(name) do |key|
         return nil unless default_class
-        @directory[key] = default_class.new(self)
+        register(key, default_class.new(self))
       end
+    end
+
+    def freeze!
+      @directory.freeze
+      @options.freeze
+      true
     end
 
     ##
@@ -216,7 +280,7 @@ module Sidekiq
     # Register a proc to handle any error which occurs within the Sidekiq process.
     #
     #   Sidekiq.configure_server do |config|
-    #     config.error_handlers << proc {|ex,ctx_hash| MyErrorService.notify(ex, ctx_hash) }
+    #     config.error_handlers << proc {|ex,ctx_hash,config| MyErrorService.notify(ex, ctx_hash) }
     #   end
     #
     # The default error handler logs errors to @logger.
@@ -225,7 +289,7 @@ module Sidekiq
     end
 
     # Register a block to run at a point in the Sidekiq lifecycle.
-    # :startup, :quiet or :shutdown are valid events.
+    # :startup, :quiet, :shutdown, or :exit are valid events.
     #
     #   Sidekiq.configure_server do |config|
     #     config.on(:shutdown) do
@@ -258,24 +322,14 @@ module Sidekiq
       @logger = logger
     end
 
-    private def parameter_size(handler)
-      target = handler.is_a?(Proc) ? handler : handler.method(:call)
-      target.parameters.size
-    end
-
     # INTERNAL USE ONLY
     def handle_exception(ex, ctx = {})
-      if @options[:error_handlers].size == 0
-        p ["!!!!!", ex]
+      if @options[:error_handlers].empty?
+        logger.error { "No error handlers configured, logging exception directly" }
+        logger.error { ex }
       end
       @options[:error_handlers].each do |handler|
-        if parameter_size(handler) == 2
-          # TODO Remove in 8.0
-          logger.info { "DEPRECATION: Sidekiq exception handlers now take three arguments, see #{handler}" }
-          handler.call(ex, {_config: self}.merge(ctx))
-        else
-          handler.call(ex, ctx, self)
-        end
+        handler.call(ex, ctx, self)
       rescue Exception => e
         l = logger
         l.error "!!! ERROR HANDLER THREW AN ERROR !!!"

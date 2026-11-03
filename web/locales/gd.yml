@@ -1,7 +1,9 @@
-﻿# elements like %{queue} are variables and should not be translated
+# elements like %{queue} are variables and should not be translated
 gd:
+  LanguageName: Gàidhlig
   Actions: Gnìomhan
   AddToQueue: Cuir ris a’ chiutha
+  AddAllToQueue: Cuir a h-uile ris a’ chiutha
   AreYouSure: A bheil thu cinnteach?
   AreYouSureDeleteJob: A bheil thu cinnteach gu bheil thu airson an obair seo a sguabadh às?
   AreYouSureDeleteQueue: A bheil thu cinnteach gu bheil thu airson ciutha %{queue} a sguabadh às? Sguabaidh seo às gach obair sa chiutha seo, nochdaidh e a-rithist nuair a phutas tu barrachd obraichean dha an uairsin.
@@ -34,6 +36,8 @@ gd:
   Jobs: Obraichean
   Kill: Marbh
   KillAll: Marbh na h-uile
+  Language: Cànan
+  LastDashboardUpdateTemplateLiteral: "An t-ath-nuadhachadh mu dheireadh: Air pròiseasadh: PROCESSED_COUNT. Air fàilligeadh: FAILED_COUNT."
   LastRetry: An oidhirp mu dheireadh
   Latency: Foillidheachd
   LivePoll: Ath-nuadhachadh beò
@@ -53,6 +57,7 @@ gd:
   PeakMemoryUsage: Bàrr cleachdadh a’ chuimhne
   Plugins: Plugain
   PollingInterval: Eadaramh an ath-nuadhachaidh
+  PollingIntervalMilliseconds: Milidiogan eadaramh an ath-nuadhachaidh
   Process: Pròiseas
   Processed: Air pròiseasadh
   Processes: Pròiseasan
@@ -95,5 +100,11 @@ gd:
   TotalExecutionTime: Ùine iomlan nan gnìomhan
   AvgExecutionTime: Ùine cuibheasach nan gnìomhan
   Context: Co-theacsa
-  Bucket: Bucaid
   NoJobMetricsFound: Cha deach meatraigeachd o chionn goirid air obair a lorg
+  Filter: Criathraich
+  AnyJobContent: Susbaint obrach sam bith
+  Profiles: Pròifilean
+  Data: Dàta
+  View: Seall
+  Token: Tòcan
+  ElapsedTime: An ùine a chaidh seachad

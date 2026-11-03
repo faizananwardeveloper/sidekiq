@@ -59,16 +59,21 @@ module Sidekiq
   #    end
   #
   class JobRetry
+    # Handled means the job failed but has been dealt with
+    # (by creating a retry, rescheduling it, etc). It still
+    # needs to be logged and dispatched to error_handlers.
     class Handled < ::RuntimeError; end
 
+    # Skip means the job failed but Sidekiq does not need to
+    # create a retry, log it or send to error_handlers.
     class Skip < Handled; end
 
     include Sidekiq::Component
 
     DEFAULT_MAX_RETRY_ATTEMPTS = 25
 
-    def initialize(capsule)
-      @config = @capsule = capsule
+    def initialize(cfg)
+      @config = cfg
       @max_retries = Sidekiq.default_configuration[:max_retries] || DEFAULT_MAX_RETRY_ATTEMPTS
       @backtrace_cleaner = Sidekiq.default_configuration[:backtrace_cleaner]
     end
@@ -91,7 +96,7 @@ module Sidekiq
       if msg["retry"]
         process_retry(nil, msg, queue, e)
       else
-        @capsule.config.death_handlers.each do |handler|
+        @config[:death_handlers].each do |handler|
           handler.call(msg, e)
         rescue => handler_ex
           handle_exception(handler_ex, {context: "Error calling death handler", job: msg})
@@ -129,10 +134,14 @@ module Sidekiq
       process_retry(jobinst, msg, queue, e)
       # We've handled this error associated with this job, don't
       # need to handle it at the global level
-      raise Skip
+      raise Handled
     end
 
     private
+
+    def now_ms
+      ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond)
+    end
 
     # Note that +jobinst+ can be nil here if an error is raised before we can
     # instantiate the job instance.  All access must be guarded and
@@ -144,17 +153,17 @@ module Sidekiq
 
       m = exception_message(exception)
       if m.respond_to?(:scrub!)
-        m.force_encoding("utf-8")
+        m.force_encoding(Encoding::UTF_8)
         m.scrub!
       end
 
       msg["error_message"] = m
       msg["error_class"] = exception.class.name
       count = if msg["retry_count"]
-        msg["retried_at"] = Time.now.to_f
+        msg["retried_at"] = now_ms
         msg["retry_count"] += 1
       else
-        msg["failed_at"] = Time.now.to_f
+        msg["failed_at"] = now_ms
         msg["retry_count"] = 0
       end
 
@@ -169,26 +178,40 @@ module Sidekiq
         msg["error_backtrace"] = compress_backtrace(lines)
       end
 
-      return retries_exhausted(jobinst, msg, exception) if count >= max_retry_attempts
-
+      # retry_for and retry are mutually exclusive - if retry_for is set,
+      # we exclusively use duration-based retry logic and ignore count-based logic
       rf = msg["retry_for"]
-      return retries_exhausted(jobinst, msg, exception) if rf && ((msg["failed_at"] + rf) < Time.now.to_f)
+      if rf
+        return retries_exhausted(jobinst, msg, exception) if (time_for(msg["failed_at"]) + rf) < Time.now
+      elsif count >= max_retry_attempts
+        return retries_exhausted(jobinst, msg, exception)
+      end
 
       strategy, delay = delay_for(jobinst, count, exception, msg)
       case strategy
       when :discard
-        return # poof!
+        msg["discarded_at"] = now_ms
+
+        return run_death_handlers(msg, exception)
       when :kill
         return retries_exhausted(jobinst, msg, exception)
       end
 
       # Logging here can break retries if the logging device raises ENOSPC #3979
       # logger.debug { "Failure! Retry #{count} in #{delay} seconds" }
-      jitter = rand(10) * (count + 1)
+      jitter = rand(10 * (count + 1))
       retry_at = Time.now.to_f + delay + jitter
       payload = Sidekiq.dump_json(msg)
       redis do |conn|
         conn.zadd("retry", retry_at.to_s, payload)
+      end
+    end
+
+    def time_for(item)
+      if item.is_a?(Float)
+        Time.at(item)
+      else
+        Time.at(item / 1000, item % 1000, :millisecond)
       end
     end
 
@@ -238,13 +261,22 @@ module Sidekiq
         handle_exception(e, {context: "Error calling retries_exhausted", job: msg})
       end
 
-      return if rv == :discard # poof!
-      send_to_morgue(msg) unless msg["dead"] == false
+      discarded = msg["dead"] == false || rv == :discard
 
-      @capsule.config.death_handlers.each do |handler|
-        handler.call(msg, exception)
+      if discarded
+        msg["discarded_at"] = now_ms
+      else
+        send_to_morgue(msg)
+      end
+
+      run_death_handlers(msg, exception)
+    end
+
+    def run_death_handlers(job, exception)
+      @config[:death_handlers].each do |handler|
+        handler.call(job, exception)
       rescue => e
-        handle_exception(e, {context: "Error calling death handler", job: msg})
+        handle_exception(e, {context: "Error calling death handler", job: job})
       end
     end
 
@@ -256,8 +288,8 @@ module Sidekiq
       redis do |conn|
         conn.multi do |xa|
           xa.zadd("dead", now.to_s, payload)
-          xa.zremrangebyscore("dead", "-inf", now - @capsule.config[:dead_timeout_in_seconds])
-          xa.zremrangebyrank("dead", 0, - @capsule.config[:dead_max_jobs])
+          xa.zremrangebyscore("dead", "-inf", now - @config[:dead_timeout_in_seconds])
+          xa.zremrangebyrank("dead", 0, - @config[:dead_max_jobs])
         end
       end
     end

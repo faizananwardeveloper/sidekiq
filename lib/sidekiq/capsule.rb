@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "sidekiq/component"
 
 module Sidekiq
@@ -9,20 +11,23 @@ module Sidekiq
   # This capsule will pull jobs from the "single" queue and process
   # the jobs with one thread, meaning the jobs will be processed serially.
   #
-  # Sidekiq.configure_server do |config|
-  #   config.capsule("single-threaded") do |cap|
-  #     cap.concurrency = 1
-  #     cap.queues = %w(single)
+  #   Sidekiq.configure_server do |config|
+  #     config.capsule("single-threaded") do |cap|
+  #       cap.concurrency = 1
+  #       cap.queues = %w(single)
+  #     end
   #   end
-  # end
   class Capsule
     include Sidekiq::Component
+    extend Forwardable
 
     attr_reader :name
     attr_reader :queues
     attr_accessor :concurrency
     attr_reader :mode
     attr_reader :weights
+
+    def_delegators :@config, :[], :[]=, :fetch, :key?, :has_key?, :merge!, :dig, :thread_priority
 
     def initialize(name, config)
       @name = name
@@ -33,16 +38,19 @@ module Sidekiq
       @mode = :strict
     end
 
+    def to_h
+      {concurrency: concurrency, mode: mode, weights: weights}
+    end
+
     def fetcher
       @fetcher ||= begin
-        inst = (config[:fetch_class] || Sidekiq::BasicFetch).new(self)
-        inst.setup(config[:fetch_setup]) if inst.respond_to?(:setup)
-        inst
+        instance = (config[:fetch_class] || Sidekiq::BasicFetch).new(self)
+        instance.setup(config[:fetch_setup]) if instance.respond_to?(:setup)
+        instance
       end
     end
 
     def stop
-      fetcher&.bulk_requeue([])
     end
 
     # Sidekiq checks queues in three modes:

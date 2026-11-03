@@ -3,7 +3,6 @@
 require_relative "helper"
 require "active_job"
 require "sidekiq/api"
-require "sidekiq/rails"
 
 class MyJob
   include Sidekiq::Job
@@ -11,6 +10,7 @@ end
 
 class QueuedJob
   include Sidekiq::Job
+
   sidekiq_options queue: :flimflam
 end
 
@@ -28,6 +28,7 @@ end
 
 class BaseJob
   include Sidekiq::Job
+
   sidekiq_options "retry" => "base"
 end
 
@@ -59,6 +60,13 @@ class MiddlewareArguments
   end
 end
 
+class MiddlewareDynamicQueue
+  def call(worker_class, job, queue, redis)
+    job["queue"] = job["args"].first.odd? ? "odd_queue" : "even_queue"
+    yield
+  end
+end
+
 class DJob < BaseJob
 end
 
@@ -66,6 +74,28 @@ class ChildHash < Hash
   def initialize(constructor)
     super
     update(constructor)
+  end
+end
+
+# Records the batches of commands sent to Redis via pipelining so tests can
+# observe how many round-trips an operation performed. Not registered globally:
+# attach it to a dedicated pool via RedisClient's `middlewares:` config option.
+module PipelinedCommandRecorder
+  class << self
+    attr_accessor :pipelines
+
+    def record
+      self.pipelines = []
+      yield
+      pipelines
+    ensure
+      self.pipelines = nil
+    end
+  end
+
+  def call_pipelined(commands, config)
+    PipelinedCommandRecorder.pipelines&.push(commands)
+    super
   end
 end
 
@@ -112,6 +142,13 @@ describe Sidekiq::Client do
       assert_raises ArgumentError do
         Sidekiq::Client.push("class" => "Blah", "args" => [1, 2, 3], "queue" => "")
       end
+    end
+
+    it "can cancel" do
+      jid = @client.push("class" => "Blah", "args" => [1, 2, 3])
+      res = @client.cancel!(jid)
+      assert res
+      assert res, @client.cancel!(jid)
     end
 
     it "can push" do
@@ -266,7 +303,7 @@ describe Sidekiq::Client do
           error = assert_raises ArgumentError do
             InterestingJob.perform_async(ChildHash.new("some" => "hash"))
           end
-          assert_includes(error.message, 'but {"some"=>"hash"} is a ChildHash')
+          assert_includes(error.message, "is a ChildHash")
         end
 
         it "raises an error when using a Struct as an argument" do
@@ -356,7 +393,7 @@ describe Sidekiq::Client do
     [1, 2, 3].each do |job_count|
       it "can push #{job_count} jobs scheduled at different times" do
         times = job_count.times.map { |i| Time.new(2019, 1, i + 1) }
-        args = job_count.times.map { |i| [i] }
+        args = job_count.times.zip
 
         jids = Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => args, "at" => times.map(&:to_f))
 
@@ -382,6 +419,85 @@ describe Sidekiq::Client do
       assert_equal 0, result.size
     end
 
+    it "spreads jobs over the interval" do
+      now = Time.parse("2012-12-26 1:00:00 -0500")
+
+      Time.stub(:now, now) do
+        jids = Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1], [2], [3], [4]], :spread_interval => 10)
+        assert_equal 4, jids.size
+
+        q = Sidekiq::ScheduledSet.new
+        assert_equal 4, q.size
+
+        q.each do |job|
+          assert (now..now + 10).cover?(job.at)
+        end
+      end
+    end
+
+    describe "default batch size" do
+      before do
+        @recorded_pool = Sidekiq::RedisConnection.create(size: 1, middlewares: [PipelinedCommandRecorder])
+        @recorded_client = Sidekiq::Client.new(pool: @recorded_pool)
+      end
+
+      after do
+        @recorded_pool.shutdown(&:close)
+      end
+
+      # Each raw_push round-trip for scheduled jobs issues a single ZADD with
+      # (score, payload) pairs: ["zadd", "schedule", score1, payload1, ...]
+      def jobs_per_zadd(pipelines)
+        pipelines.filter_map { |commands|
+          zadd = commands.find { |command| command.first.to_s.casecmp?("zadd") }
+          (zadd.size - 2) / 2 if zadd
+        }
+      end
+
+      # Immediate jobs issue a single LPUSH with one payload per job:
+      # ["lpush", "queue:default", payload1, payload2, ...]
+      def jobs_per_lpush(pipelines)
+        pipelines.filter_map { |commands|
+          lpush = commands.find { |command| command.first.to_s.casecmp?("lpush") }
+          lpush.size - 2 if lpush
+        }
+      end
+
+      it "slices scheduled jobs into batches of 100" do
+        pipelines = PipelinedCommandRecorder.record do
+          @recorded_client.push_bulk("class" => QueuedJob, "args" => (1..250).zip, "at" => Time.now.to_f + 60)
+        end
+
+        assert_equal [100, 100, 50], jobs_per_zadd(pipelines)
+        assert_equal 250, Sidekiq::ScheduledSet.new.size
+      end
+
+      it "slices jobs spread over an interval into batches of 100" do
+        pipelines = PipelinedCommandRecorder.record do
+          @recorded_client.push_bulk("class" => QueuedJob, "args" => (1..250).zip, "spread_interval" => 60)
+        end
+
+        assert_equal [100, 100, 50], jobs_per_zadd(pipelines)
+        assert_equal 250, Sidekiq::ScheduledSet.new.size
+      end
+
+      it "pushes immediate jobs in batches of 1000" do
+        pipelines = PipelinedCommandRecorder.record do
+          @recorded_client.push_bulk("class" => QueuedJob, "args" => (1..1_001).zip)
+        end
+
+        assert_equal [1_000, 1], jobs_per_lpush(pipelines)
+      end
+
+      it "honors an explicit batch_size for scheduled jobs" do
+        pipelines = PipelinedCommandRecorder.record do
+          @recorded_client.push_bulk("class" => QueuedJob, "args" => (1..250).zip, "at" => Time.now.to_f + 60, "batch_size" => 200)
+        end
+
+        assert_equal [200, 50], jobs_per_zadd(pipelines)
+      end
+    end
+
     describe "errors" do
       it "raises ArgumentError with invalid params" do
         assert_raises ArgumentError do
@@ -399,6 +515,46 @@ describe Sidekiq::Client do
         assert_raises ArgumentError do
           Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "at" => [Time.now.to_f, Time.now.to_f])
         end
+
+        assert_raises ArgumentError do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "at" => [Time.now.to_f], "spread_interval" => 10)
+        end
+
+        assert_raises ArgumentError do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "spread_interval" => -10)
+        end
+
+        assert_raises ArgumentError do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "spread_interval" => :not_a_numeric)
+        end
+      end
+
+      it "rejects a non-Numeric scalar 'at' with the documented message" do
+        err = assert_raises(ArgumentError) do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "at" => "soon")
+        end
+        assert_match(/Numeric or an Array of Numeric timestamps/, err.message)
+      end
+
+      it "rejects an empty Array 'at' with the documented message" do
+        err = assert_raises(ArgumentError) do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "at" => [])
+        end
+        assert_match(/Numeric or an Array of Numeric timestamps/, err.message)
+      end
+
+      it "rejects an explicit jid when pushing more than one job" do
+        err = assert_raises(ArgumentError) do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1], [2]], "jid" => "abc")
+        end
+        assert_match(/Explicitly passing 'jid' when pushing more than one job/, err.message)
+      end
+
+      it "rejects providing both 'at' and 'spread_interval' with the documented message" do
+        err = assert_raises(ArgumentError) do
+          Sidekiq::Client.push_bulk("class" => QueuedJob, "args" => [[1]], "at" => Time.now.to_f, "spread_interval" => 10)
+        end
+        assert_match(/Only one of 'at' or 'spread_interval'/, err.message)
       end
     end
 
@@ -411,6 +567,14 @@ describe Sidekiq::Client do
       it "pushes a large set of jobs with a different batch size" do
         jids = MyJob.perform_bulk((1..1_001).to_a.map { |x| Array(x) }, batch_size: 100)
         assert_equal 1_001, jids.size
+      end
+
+      it "pushes a large set of jobs with custom schedules" do
+        jids = MyJob.perform_bulk((1..1_001).to_a.map { |x| Array(x) }, at: [1] * 1_001)
+        assert_equal 1_001, jids.size
+
+        q = Sidekiq::ScheduledSet.new
+        assert_equal 1_001, q.size
       end
 
       it "handles no jobs" do
@@ -446,7 +610,7 @@ describe Sidekiq::Client do
 
       assert_equal($arguments_worker_class, MyJob)
       assert((minimum_job_args & $arguments_job.keys) == minimum_job_args)
-      assert_instance_of(ConnectionPool, $arguments_redis)
+      assert($arguments_redis.respond_to?(:with))
     end
 
     it "push bulk sends correct arguments to middleware" do
@@ -458,7 +622,7 @@ describe Sidekiq::Client do
 
       assert_equal($arguments_worker_class, MyJob)
       assert((minimum_job_args & $arguments_job.keys) == minimum_job_args)
-      assert_instance_of(ConnectionPool, $arguments_redis)
+      assert($arguments_redis.respond_to?(:with))
     end
 
     it "can stop some of the jobs from pushing" do
@@ -472,6 +636,18 @@ describe Sidekiq::Client do
       assert_equal 2, result.size
       refute result[0]
       assert_match(/[0-9a-f]{12}/, result[1])
+    end
+
+    it "push bulk sends worker in correct queue" do
+      @client.middleware do |chain|
+        chain.add MiddlewareDynamicQueue
+      end
+
+      @client.push_bulk("class" => MyJob, "args" => 3.times.zip)
+      even_queue = Sidekiq::Queue.new("even_queue")
+      odd_queue = Sidekiq::Queue.new("odd_queue")
+      assert_equal 2, even_queue.size
+      assert_equal 1, odd_queue.size
     end
   end
 
@@ -562,7 +738,7 @@ describe Sidekiq::Client do
   it "can specify different times when there are more jobs than the batch size" do
     job_count = 5
     times = job_count.times.map { |i| Time.new(2019, 1, i + 1).utc }
-    args = job_count.times.map { |i| [i] }
+    args = job_count.times.zip
     # When there are 3 jobs, we want to use `times[2]` for the final job.
     batch_size = 2
 
@@ -570,5 +746,55 @@ describe Sidekiq::Client do
 
     assert_equal job_count, jids.size
     assert_equal times, jids.map { |jid| Sidekiq::ScheduledSet.new.find_job(jid).at }
+  end
+
+  describe "retry after Redis error" do
+    it "retries scheduled jobs correctly" do
+      aggregator = Hash.new do |hash, key|
+        hash[key] = Hash.new do |inner_hash, inner_key|
+          inner_hash[inner_key] = []
+        end
+      end
+
+      aggregator[:raised_once] = false
+
+      pool = Sidekiq::RedisConnection.create(size: 1)
+
+      pool.with do |conn|
+        pipeline = Object.new
+
+        conn.define_singleton_method(:pipelined) do |&block|
+          block.call(pipeline)
+        end
+
+        pipeline.define_singleton_method(:zadd) do |set, payloads|
+          if aggregator[:raised_once] == false
+            aggregator[:raised_once] = true
+            raise RedisClient::Error, "READONLY"
+          else
+            aggregator[:zadd][set].push(*payloads)
+          end
+        end
+
+        pipeline.define_singleton_method(:sadd) do |set, elements|
+          aggregator[:sadd][set].push(*elements)
+        end
+
+        pipeline.define_singleton_method(:lpush) do |list, elements|
+          aggregator[:lpush][list].push(*elements)
+        end
+      end
+
+      Sidekiq::Client.via(pool) do
+        client = Sidekiq::Client.new
+        client.push_bulk("class" => MyJob, "args" => (1..10).zip, "at" => 10)
+      end
+
+      # 20 since the array of [at, dumped_payload] elements gets flattened.
+      assert_equal 20, aggregator[:zadd]["schedule"].size
+      assert_equal [], aggregator[:sadd]["queues"]
+      assert_equal 0, aggregator[:lpush]["queue:default"].size
+      assert_equal true, aggregator[:raised_once]
+    end
   end
 end

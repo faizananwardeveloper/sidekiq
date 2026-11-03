@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+
+    runs-on: ubuntu-latest
+    name: "${{ matrix.ruby }} / rails ${{ matrix.rails }} / ${{ matrix.database.image }}-${{ matrix.database.version }}"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # we test latest and earliest supported versions
+        # to minimize our build matrix
+        ruby: ["ruby-3.2", "ruby-4.0"]
+        rails: ["7.1", "8.1"]
+        database: [
+          { image: "redis", version: "7.0.15" },
+          { image: "redis", version: "latest" },
+          { image: "valkey/valkey", version: "9" },
+          { image: "docker.dragonflydb.io/dragonflydb/dragonfly", version: "latest" }
+        ]
+
+    env:
+      RAILS_VERSION: ${{ matrix.rails }}
+
+    services:
+      redis:
+        image: ${{ matrix.database.image }}:${{ matrix.database.version }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Ruby ${{ matrix.ruby }}
+      uses: ruby/setup-ruby@v1
+      with:
+        bundler-cache: true
+        ruby-version: ${{ matrix.ruby }}
+
+    - name: Lint ERB files with HERB
+      run: bundle exec rake lint:herb
+
+    - name: Run tests
+      run: bundle exec rake test

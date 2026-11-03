@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+
+require "active_job/arguments"
 require "active_support/current_attributes"
 
 module Sidekiq
@@ -18,6 +21,8 @@ module Sidekiq
   #   Sidekiq::CurrentAttributes.persist(["Myapp::Current", "Myapp::OtherCurrent"])
   #
   module CurrentAttributes
+    Serializer = ::ActiveJob::Arguments
+
     class Save
       include Sidekiq::ClientMiddleware
 
@@ -31,7 +36,7 @@ module Sidekiq
             attrs = strklass.constantize.attributes
             # Retries can push the job N times, we don't
             # want retries to reset cattr. #5692, #5090
-            job[key] = attrs if attrs.any?
+            job[key] = Serializer.serialize(attrs) if attrs.any?
           end
         end
         yield
@@ -45,23 +50,42 @@ module Sidekiq
         @cattrs = cattrs
       end
 
-      def call(_, job, _, &block)
-        cattrs_to_reset = []
+      def call(_, job, *, &block)
+        klass_attrs = {}
 
         @cattrs.each do |(key, strklass)|
-          if job.has_key?(key)
-            constklass = strklass.constantize
-            cattrs_to_reset << constklass
+          next unless job.has_key?(key)
 
-            job[key].each do |(attribute, value)|
-              constklass.public_send(:"#{attribute}=", value)
-            end
-          end
+          klass_attrs[strklass.constantize] = Serializer.deserialize(job[key]).to_h
         end
 
-        yield
-      ensure
-        cattrs_to_reset.each(&:reset)
+        wrap(klass_attrs.to_a, &block)
+      end
+
+      private
+
+      def wrap(klass_attrs, &block)
+        klass, attrs = klass_attrs.shift
+        return block.call unless klass
+
+        retried = false
+
+        begin
+          set_succeeded = false
+          klass.set(attrs) do
+            set_succeeded = true
+            wrap(klass_attrs, &block)
+          end
+        rescue NoMethodError
+          # Don't retry if the no method error didn't come from current attributes
+          raise if retried || set_succeeded
+
+          # It is possible that the `CurrentAttributes` definition
+          # was changed before the job started processing.
+          attrs = attrs.select { |attr| klass.respond_to?(attr) }
+          retried = true
+          retry
+        end
       end
     end
 
@@ -69,8 +93,9 @@ module Sidekiq
       def persist(klass_or_array, config = Sidekiq.default_configuration)
         cattrs = build_cattrs_hash(klass_or_array)
 
+        config.client_middleware.prepend Load, cattrs
         config.client_middleware.add Save, cattrs
-        config.server_middleware.add Load, cattrs
+        config.server_middleware.prepend Load, cattrs
       end
 
       private

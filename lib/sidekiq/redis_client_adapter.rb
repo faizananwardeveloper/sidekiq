@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require "set"
 require "redis_client"
 require "redis_client/decorator"
 
@@ -32,9 +31,11 @@ module Sidekiq
         zremrangebyrank zremrangebyscore]
 
       USED_COMMANDS.each do |name|
-        define_method(name) do |*args, **kwargs|
-          @client.call(name, *args, **kwargs)
-        end
+        class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+          def #{name}(*args, **kwargs)
+            @client.call("#{name}", *args, **kwargs)
+          end
+        RUBY
       end
 
       private
@@ -42,8 +43,8 @@ module Sidekiq
       # this allows us to use methods like `conn.hmset(...)` instead of having to use
       # redis-client's native `conn.call("hmset", ...)`
       def method_missing(*args, &block)
-        warn("[sidekiq#5788] Redis has deprecated the `#{args.first}`command, called at #{caller(1..1)}") if DEPRECATED_COMMANDS.include?(args.first)
-        @client.call(*args, *block)
+        warn("[sidekiq#5788] Redis has deprecated the `#{args.first}` command, called at #{caller(1..1)}") if DEPRECATED_COMMANDS.include?(args.first)
+        @client.call(*args, &block)
       end
       ruby2_keywords :method_missing if respond_to?(:ruby2_keywords, true)
 
@@ -64,6 +65,13 @@ module Sidekiq
       opts = client_opts(options)
       @config = if opts.key?(:sentinels)
         RedisClient.sentinel(**opts)
+      elsif opts.key?(:nodes)
+        # Sidekiq does not support Redis clustering but Sidekiq Enterprise's
+        # rate limiters are cluster-safe so we can scale to millions
+        # of rate limiters using a Redis cluster. This requires the
+        # `redis-cluster-client` gem.
+        # Sidekiq::Limiter.redis = { nodes: [...] }
+        RedisClient.cluster(**opts)
       else
         RedisClient.config(**opts)
       end
@@ -90,13 +98,9 @@ module Sidekiq
         opts.delete(:network_timeout)
       end
 
-      if opts[:driver]
-        opts[:driver] = opts[:driver].to_sym
-      end
-
       opts[:name] = opts.delete(:master_name) if opts.key?(:master_name)
       opts[:role] = opts[:role].to_sym if opts.key?(:role)
-      opts.delete(:url) if opts.key?(:sentinels)
+      opts[:driver] = opts[:driver].to_sym if opts.key?(:driver)
 
       # Issue #3303, redis-rb will silently retry an operation.
       # This can lead to duplicate jobs if Sidekiq::Client's LPUSH
@@ -104,6 +108,10 @@ module Sidekiq
       # than the reconnect silently fixing a problem; we keep it
       # on by default.
       opts[:reconnect_attempts] ||= 1
+
+      # Identify ourselves to Redis via CLIENT SETINFO so connections
+      # are distinguishable in CLIENT LIST / CLIENT INFO output.
+      opts[:driver_info] ||= "sidekiq_v#{Sidekiq::VERSION}"
 
       opts
     end

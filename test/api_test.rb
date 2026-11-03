@@ -2,6 +2,7 @@
 
 require_relative "helper"
 require "sidekiq/api"
+require "sidekiq/job_retry"
 require "active_job"
 require "action_mailer"
 
@@ -21,17 +22,22 @@ end
 
 class JobWithTags
   include Sidekiq::Job
+
   sidekiq_options tags: ["foo"]
 end
 
 SERIALIZED_JOBS = {
   "5.x" => [
-    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ApiAjJob","queue":"default","args":[{"job_class":"ApiAjJob","job_id":"f1bde53f-3852-4ae4-a879-c12eacebbbb0","provider_job_id":null,"queue_name":"default","priority":null,"arguments":[1,2,3],"executions":0,"locale":"en"}],"retry":true,"jid":"099eee72911085a511d0e312","created_at":1568305542.339916,"enqueued_at":1568305542.339947}',
-    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ActionMailer::DeliveryJob","queue":"mailers","args":[{"job_class":"ActionMailer::DeliveryJob","job_id":"19cc0115-3d1c-4bbe-a51e-bfa1385895d1","provider_job_id":null,"queue_name":"mailers","priority":null,"arguments":["ApiMailer","test_email","deliver_now",1,2,3],"executions":0,"locale":"en"}],"retry":true,"jid":"37436e5504936400e8cf98db","created_at":1568305542.370133,"enqueued_at":1568305542.370241}'
+    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ApiAjJob","queue":"default","args":[{"job_class":"ApiAjJob","job_id":"f1bde53f-3852-4ae4-a879-c12eacebbbb0","provider_job_id":null,"queue_name":"default","priority":null,"arguments":[1,2,3],"executions":0,"locale":"en"}],"retry":true,"jid":"099eee72911085a511d0e312","created_at":1568305542339,"enqueued_at":1568305542339}',
+    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ActionMailer::DeliveryJob","queue":"mailers","args":[{"job_class":"ActionMailer::DeliveryJob","job_id":"19cc0115-3d1c-4bbe-a51e-bfa1385895d1","provider_job_id":null,"queue_name":"mailers","priority":null,"arguments":["ApiMailer","test_email","deliver_now",1,2,3],"executions":0,"locale":"en"}],"retry":true,"jid":"37436e5504936400e8cf98db","created_at":1568305542370,"enqueued_at":1568305542370}'
   ],
   "6.x" => [
-    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ApiAjJob","queue":"default","args":[{"job_class":"ApiAjJob","job_id":"ff2b48d4-bdce-4825-af6b-ef8c11ab651e","provider_job_id":null,"queue_name":"default","priority":null,"arguments":[1,2,3],"executions":0,"exception_executions":{},"locale":"en","timezone":"UTC","enqueued_at":"2019-09-12T16:28:37Z"}],"retry":true,"jid":"ce121bf77b37ae81fe61b6dc","created_at":1568305717.9469702,"enqueued_at":1568305717.947005}',
-    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ActionMailer::MailDeliveryJob","queue":"mailers","args":[{"job_class":"ActionMailer::MailDeliveryJob","job_id":"2f967da1-a389-479c-9a4e-5cc059e6d65c","provider_job_id":null,"queue_name":"mailers","priority":null,"arguments":["ApiMailer","test_email","deliver_now",{"params":{"user":{"_aj_globalid":"gid://app/User/1"}, "_aj_symbol_keys":["user"]},"args":[1,2,3],"_aj_symbol_keys":["params", "args"]}],"executions":0,"exception_executions":{},"locale":"en","timezone":"UTC","enqueued_at":"2019-09-12T16:28:37Z"}],"retry":true,"jid":"469979df52bb9ef9f48b49e1","created_at":1568305717.9457421,"enqueued_at":1568305717.9457731}'
+    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ApiAjJob","queue":"default","args":[{"job_class":"ApiAjJob","job_id":"ff2b48d4-bdce-4825-af6b-ef8c11ab651e","provider_job_id":null,"queue_name":"default","priority":null,"arguments":[1,2,3],"executions":0,"exception_executions":{},"locale":"en","timezone":"UTC","enqueued_at":"2019-09-12T16:28:37Z"}],"retry":true,"jid":"ce121bf77b37ae81fe61b6dc","created_at":1568305717946,"enqueued_at":1568305717947}',
+    '{"class":"ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper","wrapped":"ActionMailer::MailDeliveryJob","queue":"mailers","args":[{"job_class":"ActionMailer::MailDeliveryJob","job_id":"2f967da1-a389-479c-9a4e-5cc059e6d65c","provider_job_id":null,"queue_name":"mailers","priority":null,"arguments":["ApiMailer","test_email","deliver_now",{"params":{"user":{"_aj_globalid":"gid://app/User/1"}, "_aj_symbol_keys":["user"]},"args":[1,2,3],"_aj_symbol_keys":["params", "args"]}],"executions":0,"exception_executions":{},"locale":"en","timezone":"UTC","enqueued_at":"2019-09-12T16:28:37Z"}],"retry":true,"jid":"469979df52bb9ef9f48b49e1","created_at":1568305717945,"enqueued_at":1568305717945}'
+  ],
+  "8.x" => [
+    '{"class":"Sidekiq::ActiveJob::Wrapper","wrapped":"ApiAjJob","queue":"default","args":[{"job_class":"ApiAjJob","job_id":"37649eb0-c437-4e00-8a29-85cc12da1440","provider_job_id":null,"queue_name":"default","priority":null,"arguments":[1,2,3],"executions":0,"exception_executions":{},"locale":"en","timezone":null,"enqueued_at":"2024-09-19T16:39:26.609737000Z","scheduled_at":null}],"retry":true,"jid":"ec42f101ed1b16f27c6a6188","created_at":1726763966610,"enqueued_at":1726763966610}',
+    '{"class":"Sidekiq::ActiveJob::Wrapper","wrapped":"ActionMailer::MailDeliveryJob","queue":"mailers","args":[{"job_class":"ActionMailer::MailDeliveryJob","job_id":"d6573e12-dd78-454a-83d5-67df94934c82","provider_job_id":null,"queue_name":"mailers","priority":null,"arguments":["ApiMailer","test_email","deliver_now",{"args":[1,2,3],"_aj_ruby2_keywords":["args"]}],"executions":0,"exception_executions":{},"locale":"en","timezone":null,"enqueued_at":"2024-09-19T16:45:38.673195000Z","scheduled_at":null}],"retry":true,"jid":"2cd7874f7651115f453d6315","created_at":1726764338673,"enqueued_at":1726764338673}'
   ]
 }
 
@@ -47,6 +53,7 @@ describe "API" do
       assert_equal 0, s.failed
       assert_equal 0, s.enqueued
       assert_equal 0, s.default_queue_latency
+      assert_kind_of Float, s.default_queue_latency
       assert_equal 0, s.workers_size
     end
 
@@ -134,16 +141,43 @@ describe "API" do
       end
     end
 
+    describe "queue_summaries" do
+      it "returns an object with queue name, size, latency, and paused status" do
+        @cfg.redis do |conn|
+          conn.rpush "queue:foo", "{\"enqueued_at\": #{(Time.now.to_f * 1000 - 50).floor}}"
+          conn.sadd "queues", ["foo"]
+          conn.sadd "paused", ["bar"]
+
+          3.times { conn.rpush "queue:bar", "{\"enqueued_at\": #{(Time.now.to_f * 1000 - 100).floor}}" }
+          conn.sadd "queues", ["bar"]
+        end
+
+        result = Sidekiq::Stats.new.queue_summaries
+
+        assert_equal 2, result.length
+
+        assert_equal "bar", result[0].name
+        assert_equal 3, result[0].size
+        assert_operator result[0].latency, :>, 0.09
+        assert_equal true, result[0].paused?
+
+        assert_equal "foo", result[1].name
+        assert_equal 1, result[1].size
+        assert_operator result[1].latency, :>, 0.04
+        assert_equal false, result[1].paused?
+      end
+    end
+
     describe "enqueued" do
       it "handles latency for good jobs" do
         @cfg.redis do |conn|
-          conn.rpush "queue:default", "{\"enqueued_at\": #{Time.now.to_f}}"
+          conn.rpush "queue:default", "{\"enqueued_at\": #{(Time.now.to_f * 1000 - 50).floor}}"
           conn.sadd "queues", ["default"]
         end
         s = Sidekiq::Stats.new
-        assert s.default_queue_latency > 0
+        assert_operator s.default_queue_latency, :>, 0.04
         q = Sidekiq::Queue.new
-        assert q.latency > 0
+        assert_operator q.latency, :>, 0.04
       end
 
       it "handles latency for incomplete jobs" do
@@ -240,6 +274,7 @@ describe "API" do
       q = Sidekiq::Queue.new
       assert_equal 0, q.size
       assert_equal 0, q.latency
+      assert_kind_of Float, q.latency
     end
 
     before do
@@ -249,14 +284,15 @@ describe "API" do
 
     it "can enumerate jobs" do
       q = Sidekiq::Queue.new
-      Time.stub(:now, Time.new(2012, 12, 26)) do
+      backthen = ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond) - (365 * 24 * 60 * 60 * 1000)
+      ::Process.stub(:clock_gettime, backthen) do
         ApiJob.perform_async(1, "mike")
         assert_equal [ApiJob.name], q.map(&:klass)
 
         job = q.first
         assert_equal 24, job.jid.size
         assert_equal [1, "mike"], job.args
-        assert_equal Time.new(2012, 12, 26), job.enqueued_at
+        assert_equal Time.at(backthen.to_s[0..-4].to_i), Time.at(job.enqueued_at.to_i)
       end
       assert q.latency > 10_000_000
 
@@ -297,7 +333,8 @@ describe "API" do
 
           expected_args_by_version = {
             "5.x" => [1, 2, 3],
-            "6.x" => [{"user" => "gid://app/User/1"}, [1, 2, 3]]
+            "6.x" => [{"user" => "gid://app/User/1"}, [1, 2, 3]],
+            "8.x" => [nil, [1, 2, 3]]
           }
           assert_equal "#{ApiMailer.name}#test_email", x.display_class
           assert_equal expected_args_by_version[ver], x.display_args
@@ -317,6 +354,73 @@ describe "API" do
 
       job_id = JobWithTags.perform_async
       assert_equal ["foo"], Sidekiq::Queue.new.find_job(job_id).tags
+    end
+
+    describe "JobRecord parsing and display" do
+      it "renders a malformed Redis payload safely instead of raising" do
+        j = Sidekiq::JobRecord.new("not-json", "default")
+        assert_equal({}, j.item)
+        assert_equal ["not-json"], j.args
+        assert_nil j.klass
+      end
+
+      it "redacts the final argument when the job is marked encrypted" do
+        payload = {"class" => "X", "args" => ["a", "b", "secret"], "queue" => "default", "encrypt" => true}
+        j = Sidekiq::JobRecord.new(payload, "default")
+        assert_equal ["a", "b", "[encrypted data]"], j.display_args
+      end
+
+      it "passes a Hash payload through without re-parsing" do
+        payload = {"class" => "X", "args" => [1, 2], "queue" => "default"}
+        j = Sidekiq::JobRecord.new(payload, "default")
+        assert_same payload, j.item
+      end
+
+      it "parses a JSON string payload into the item hash" do
+        json = Sidekiq.dump_json("class" => "X", "args" => [1, 2], "queue" => "default")
+        j = Sidekiq::JobRecord.new(json, "default")
+        assert_equal "X", j.klass
+        assert_equal [1, 2], j.args
+      end
+    end
+
+    describe "error information API" do
+      def compressed_backtrace(lines)
+        Sidekiq::JobRetry.new(@cfg).send(:compress_backtrace, lines)
+      end
+
+      it "decompresses the stored error_backtrace back into the original array" do
+        record = Sidekiq::JobRecord.new(
+          {"class" => "X", "args" => [], "error_backtrace" => compressed_backtrace(["a.rb:1", "b.rb:2"])},
+          "default"
+        )
+        assert_equal ["a.rb:1", "b.rb:2"], record.error_backtrace
+      end
+
+      it "returns nil for error_backtrace when none was stored, and memoizes the nil" do
+        record = Sidekiq::JobRecord.new({"class" => "X", "args" => []}, "default")
+        assert_nil record.error_backtrace
+        record.instance_variable_set(:@error_backtrace, "should-not-be-recomputed")
+        assert_equal "should-not-be-recomputed", record.error_backtrace
+      end
+
+      it "SortedEntry#error? reflects the presence of error_class" do
+        parent = Sidekiq::RetrySet.new
+        with_err = Sidekiq::SortedEntry.new(parent, Time.now.to_f,
+          Sidekiq.dump_json("class" => "X", "args" => [], "error_class" => "RuntimeError"))
+        without_err = Sidekiq::SortedEntry.new(parent, Time.now.to_f,
+          Sidekiq.dump_json("class" => "X", "args" => []))
+
+        assert with_err.error?
+        refute without_err.error?
+      end
+
+      it "SortedEntry inherits error_backtrace decompression from JobRecord" do
+        entry = Sidekiq::SortedEntry.new(Sidekiq::RetrySet.new, Time.now.to_f,
+          Sidekiq.dump_json("class" => "X", "args" => [],
+            "error_backtrace" => compressed_backtrace(["only-line.rb:1"])))
+        assert_equal ["only-line.rb:1"], entry.error_backtrace
+      end
     end
 
     it "can delete jobs" do
@@ -359,6 +463,18 @@ describe "API" do
       assert_equal queued_job.jid, job_id
       assert_nil Sidekiq::ScheduledSet.new.find_job(job_id)
       refute_nil Sidekiq::ScheduledSet.new.find_job(remain_id)
+    end
+
+    it "can enqueue many pages of jobs when paginated" do
+      jids = Sidekiq::Client.push_bulk("class" => ApiJob,
+        "args" => Array.new(200) { [] },
+        "at" => Time.now.to_f)
+
+      assert_equal 200, jids.size
+      ss = Sidekiq::ScheduledSet.new
+      assert_equal 200, ss.size
+      ss.each(&:add_to_queue)
+      assert_equal 0, ss.size
     end
 
     it "can kill a scheduled job" do
@@ -537,8 +653,8 @@ describe "API" do
         "key" => identity_string,
         "identity" => identity_string,
         "started_at" => Time.now.to_f - 15,
-        "queues" => ["foo", "bar"],
-        "weights" => {"foo" => 1, "bar" => 1},
+        "capsules" => {"default" => {"mode" => "weighted", "concurrency" => 5, "weights" => {"foo" => 1, "bar" => 1}},
+                       "single" => {"mode" => "strict", "concurrency" => 1, "weights" => {"single" => 0}}},
         "version" => Sidekiq::VERSION,
         "embedded" => false
       }
@@ -558,8 +674,9 @@ describe "API" do
       assert_equal 10, data["busy"]
       assert_equal time, data["beat"]
       assert_equal 123, data["pid"]
-      assert_equal ["foo", "bar"], data.queues
-      assert_equal({"foo" => 1, "bar" => 1}, data.weights)
+      assert_equal %w[foo bar single], data.queues
+      assert_equal({"foo" => 1, "bar" => 1, "single" => 0}, data.weights)
+      assert_equal({"default" => {"mode" => "weighted", "concurrency" => 5, "weights" => {"foo" => 1, "bar" => 1}}, "single" => {"mode" => "strict", "concurrency" => 1, "weights" => {"single" => 0}}}, data.capsules)
       assert_equal Sidekiq::VERSION, data.version
       assert_equal false, data.embedded?
       data.quiet!
@@ -567,6 +684,31 @@ describe "API" do
       signals_string = "#{odata["key"]}-signals"
       assert_equal "TERM", @cfg.redis { |c| c.lpop(signals_string) }
       assert_equal "TSTP", @cfg.redis { |c| c.lpop(signals_string) }
+    end
+
+    it "reads process concurrency from redis hash fields" do
+      identity_string = "identity_string"
+      odata = {
+        "pid" => 123,
+        "hostname" => Socket.gethostname,
+        "key" => identity_string,
+        "identity" => identity_string,
+        "started_at" => Time.now.to_f - 15,
+        "concurrency" => 99,
+        "capsules" => {"default" => {"mode" => "weighted", "concurrency" => 5, "weights" => {"foo" => 1, "bar" => 1}}},
+        "version" => Sidekiq::VERSION,
+        "embedded" => false
+      }
+
+      @cfg.redis do |conn|
+        conn.multi do |transaction|
+          transaction.sadd("processes", [odata["key"]])
+          transaction.hset(odata["key"], "info", Sidekiq.dump_json(odata), "concurrency", 7, "busy", 10, "beat", Time.now.to_f)
+        end
+      end
+
+      pro = Sidekiq::ProcessSet.new.to_a.first
+      assert_equal 7, pro["concurrency"]
     end
 
     it "can find processes" do
@@ -577,8 +719,7 @@ describe "API" do
         "key" => identity_string,
         "identity" => identity_string,
         "started_at" => Time.now.to_f - 15,
-        "queues" => ["foo", "bar"],
-        "weights" => {"foo" => 1, "bar" => 1},
+        "capsules" => {"default" => {"mode" => "weighted", "concurrency" => 5, "weights" => {"foo" => 1, "bar" => 1}}},
         "version" => Sidekiq::VERSION,
         "embedded" => true
       }
@@ -613,6 +754,46 @@ describe "API" do
       assert_equal "Can't stop an embedded process", e.message
     end
 
+    describe "Process signal and status" do
+      def make_process(identity, attrs = {})
+        Sidekiq::Process.new({"identity" => identity}.merge(attrs))
+      end
+
+      it "quiet! pushes TSTP to the identity-signals list with a 60s TTL" do
+        make_process("h1:1").quiet!
+
+        signals, ttl = @cfg.redis { |c|
+          [c.lrange("h1:1-signals", 0, -1), c.ttl("h1:1-signals")]
+        }
+        assert_equal ["TSTP"], signals
+        assert_operator ttl, :>, 0
+        assert_operator ttl, :<=, 60
+      end
+
+      it "stop! pushes TERM and dump_threads pushes TTIN to the same signals list" do
+        proc1 = make_process("h2:2")
+        proc1.stop!
+        proc1.dump_threads
+
+        # lpush prepends, so newest signal is first
+        signals = @cfg.redis { |c| c.lrange("h2:2-signals", 0, -1) }
+        assert_equal ["TTIN", "TERM"], signals
+      end
+
+      it "stopping? reflects the 'quiet' flag in the process info" do
+        refute make_process("h3:3").stopping?
+        assert make_process("h3:3", "quiet" => "true").stopping?
+        refute make_process("h3:3", "quiet" => "false").stopping?
+      end
+
+      it "leader? returns true only when the process identity matches dear-leader" do
+        @cfg.redis { |c| c.set("dear-leader", "h4:4") }
+
+        assert make_process("h4:4").leader?
+        refute make_process("other:9").leader?
+      end
+    end
+
     it "can enumerate workers" do
       w = Sidekiq::Workers.new
       assert_equal 0, w.size
@@ -637,10 +818,6 @@ describe "API" do
       w.each do |p, x, work|
         assert_equal key, p
         assert_equal "1234", x
-        assert_equal "default", work["queue"]
-        assert_equal("{}", work["payload"])
-        assert_equal Time.now.year, Time.at(work["run_at"]).year
-
         assert_equal "{}", work.payload
         assert_equal({}, work.job.item)
         assert_equal(Time.now.year, work.run_at.year)
@@ -686,18 +863,31 @@ describe "API" do
       add_retry("foo1")
       add_retry("foo2")
 
+      now = Time.now.to_f
       retries = Sidekiq::RetrySet.new
       assert_equal 2, retries.size
-      refute(retries.map { |r| r.score > (Time.now.to_f + 9) }.any?)
+      assert_equal(0, retries.count { |r| r.score > (now + 9) })
 
       retries.each do |retri|
-        retri.reschedule(Time.now + 15) if retri.jid == "foo1"
-        retri.reschedule(Time.now.to_f + 10) if retri.jid == "foo2"
+        retri.reschedule(now + 15) if retri.jid == "foo1"
+        retri.reschedule(now + 10) if retri.jid == "foo2"
       end
 
+      now = Time.now.to_f
       assert_equal 2, retries.size
-      assert(retries.map { |r| r.score > (Time.now.to_f + 9) }.any?)
-      assert(retries.map { |r| r.score > (Time.now.to_f + 14) }.any?)
+      assert_equal(2, retries.count { |r| r.score > (now + 9) })
+      assert_equal(1, retries.count { |r| r.score > (now + 14) })
+    end
+
+    it "keeps the in-memory entry consistent with Redis after reschedule" do
+      add_retry("foo1")
+      entry = Sidekiq::RetrySet.new.first
+      new_score = Time.now.to_f + 500
+
+      entry.reschedule(Time.at(new_score))
+
+      assert_in_delta new_score, entry.score, 0.001
+      assert_in_delta new_score, entry.at.to_f, 0.001
     end
 
     it "prunes processes which have died" do
@@ -720,11 +910,200 @@ describe "API" do
       assert_equal 1, ps.to_a.size
     end
 
-    def add_retry(jid = "bob", at = Time.now.to_f)
-      payload = Sidekiq.dump_json("class" => "ApiJob", "args" => [1, "mike"], "queue" => "default", "jid" => jid, "retry_count" => 2, "failed_at" => Time.now.to_f, "error_backtrace" => ["line1", "line2"])
-      @cfg.redis do |conn|
-        conn.zadd("retry", at.to_s, payload)
+    describe "ProcessSet aggregates and leader" do
+      def add_process(key, info, concurrency: 0, rss: 0)
+        @cfg.redis do |conn|
+          conn.sadd("processes", [key])
+          conn.hset(key, "info", Sidekiq.dump_json(info),
+            "concurrency", concurrency,
+            "busy", 0,
+            "rss", rss,
+            "beat", Time.now.to_f)
+        end
+      end
+
+      it "totals concurrency across all registered processes" do
+        add_process("h1:1", {"pid" => 1, "hostname" => "h1"}, concurrency: 5)
+        add_process("h2:2", {"pid" => 2, "hostname" => "h2"}, concurrency: 12)
+
+        assert_equal 17, Sidekiq::ProcessSet.new(false).total_concurrency
+      end
+
+      it "totals RSS across all registered processes" do
+        add_process("h1:1", {"pid" => 1, "hostname" => "h1"}, rss: 1024)
+        add_process("h2:2", {"pid" => 2, "hostname" => "h2"}, rss: 2048)
+
+        ps = Sidekiq::ProcessSet.new(false)
+        assert_equal 3072, ps.total_rss_in_kb
+        assert_equal ps.total_rss_in_kb, ps.total_rss
+      end
+
+      it "returns the dear-leader identity and memoizes the lookup" do
+        @cfg.redis { |c| c.set("dear-leader", "leader-identity") }
+        ps = Sidekiq::ProcessSet.new(false)
+        assert_equal "leader-identity", ps.leader
+
+        @cfg.redis { |c| c.del("dear-leader") }
+        assert_equal "leader-identity", ps.leader, "expected leader to be memoized after first read"
+      end
+
+      it "returns an empty string for leader when no leader is set (OSS)" do
+        assert_equal "", Sidekiq::ProcessSet.new(false).leader
       end
     end
+  end
+
+  describe "dead set" do
+    after do
+      @cfg.death_handlers.clear
+    end
+
+    it "can kill a job" do
+      death_handler_call_count = 0
+      expected_ex = RuntimeError.new("Job killed by API")
+      @cfg.death_handlers << ->(_job, ex) do
+        death_handler_call_count += 1
+        assert_equal expected_ex.message, ex.message
+      end
+      job_id = ApiJob.perform_in(100, 1, '{"foo":123}')
+      job = Sidekiq::ScheduledSet.new.find_job(job_id)
+      ds = Sidekiq::DeadSet.new
+      assert_equal 0, ds.size
+      ds.kill(job.value)
+      assert_equal 1, ds.size
+      assert_equal 1, death_handler_call_count
+    end
+
+    it "can kill a job without notifying failure" do
+      death_handler_call_count = 0
+      Sidekiq.default_configuration.death_handlers << ->(_job, _ex) do
+        death_handler_call_count += 1
+      end
+      job_id = ApiJob.perform_in(100, 1, '{"foo":123}')
+      job = Sidekiq::ScheduledSet.new.find_job(job_id)
+      ds = Sidekiq::DeadSet.new
+      assert_equal 0, ds.size
+      ds.kill(job.value, notify_failure: false)
+      assert_equal 1, ds.size
+      assert_equal 0, death_handler_call_count
+    end
+
+    it "can kill a job with a custom exception" do
+      death_handler_call_count = 0
+      expected_ex = StandardError.new("custom error")
+      Sidekiq.default_configuration.death_handlers << ->(_job, ex) do
+        death_handler_call_count += 1
+        assert_equal expected_ex.message, ex.message
+      end
+      job_id = ApiJob.perform_in(100, 1, '{"foo":123}')
+      job = Sidekiq::ScheduledSet.new.find_job(job_id)
+      ds = Sidekiq::DeadSet.new
+      assert_equal 0, ds.size
+      ds.kill(job.value, ex: expected_ex)
+      assert_equal 1, ds.size
+      assert_equal 1, death_handler_call_count
+    end
+
+    it "can retry and kill all safely" do
+      dcount = 1000
+      hash = Sidekiq.default_configuration
+      hash[:dead_max_jobs] = dcount
+
+      dcount.times do
+        add_dead
+      end
+      rcount = 500
+      rcount.times do
+        add_retry
+      end
+
+      q = Sidekiq::Queue.new
+      ds = Sidekiq::DeadSet.new
+      rs = Sidekiq::RetrySet.new
+      assert_equal dcount, ds.size
+      assert_equal rcount, rs.size
+
+      ds.retry_all
+      assert_equal 0, ds.size
+      assert_equal dcount, q.size
+
+      timing("kill_all") { rs.kill_all }
+      assert_equal rcount, ds.size
+      assert_equal 0, rs.size
+    end
+  end
+
+  describe "profiling" do
+    it "can show profile records" do
+      ps = Sidekiq::ProfileSet.new
+      assert_equal 0, ps.size
+
+      before = Time.now
+      add_profile(1, "mike", "123")
+      add_profile(2, "mike", "456")
+      add_profile(3, "fred", "789")
+      assert_equal 0, ps.size
+      ps = Sidekiq::ProfileSet.new
+      assert_equal 3, ps.size
+
+      ps.each do |record|
+        assert_equal "ProfileJob", record.type
+        assert_operator before, :<, record.started_at
+        assert record.token
+        assert record.jid
+      end
+    end
+  end
+
+  it "runs load hooks" do
+    ran = false
+    Sidekiq.loader.on_load(:api) { ran = true }
+    assert(ran)
+  end
+end
+
+FAKE_DATA = "H4sICNrWI2cAA3NvbWUuanNvbgCrVlDKTq1UslJQKkvMKU1V0lFQSiwqSgSJRBvqKBjpKBjHKtRyAQDd7Kt/JwAAAA=="
+
+def add_profile(count, token, jid)
+  type = "ProfileJob"
+  started_at = Time.now + count
+  rundata = {
+    started_at: started_at.to_i,
+    token: token,
+    type: type,
+    jid: jid,
+    size: FAKE_DATA.bytesize,
+    elapsed: 4.36273,
+    # .gz extension tells Vernier to compress the data
+    filename: "#{token}-#{type}-#{jid}-#{started_at.strftime("%Y%m%d-%H%M%S")}.json.gz"
+  }
+
+  key = "#{token}-#{jid}"
+  @cfg.redis do |conn|
+    conn.multi do |m|
+      m.zadd("profiles", Time.now.to_f + 60, key)
+      m.hset(key, rundata.merge(data: FAKE_DATA.unpack1("m")))
+      m.expire(key, 60)
+    end
+  end
+end
+
+def timing(str)
+  yield
+  # p [str, (a = Time.now; yield; (Time.now - a))]
+end
+
+def add_retry(jid = "bob", at = Time.now.to_f)
+  payload = Sidekiq.dump_json("class" => "ApiJob", "args" => [1, "mike"], "queue" => "default", "jid" => jid, "retry_count" => 2, "failed_at" => Time.now.to_f, "error_backtrace" => ["line1", "line2"])
+  @cfg.redis do |conn|
+    conn.zadd("retry", at.to_s, payload)
+  end
+end
+
+def add_dead(jid = nil, at = Time.now.to_f)
+  jid ||= SecureRandom.hex(12)
+  payload = Sidekiq.dump_json("class" => "ApiJob", "args" => [1, "mike"], "queue" => "default", "jid" => jid)
+  @cfg.redis do |conn|
+    conn.zadd("dead", at.to_s, payload)
   end
 end

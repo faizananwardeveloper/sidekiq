@@ -36,8 +36,8 @@ module Sidekiq
     # has a heartbeat thread, caller can use `async_beat: false`
     # and instead have thread call Launcher#heartbeat every N seconds.
     def run(async_beat: true)
-      Sidekiq.freeze!
       logger.debug { @config.merge!({}) }
+      Sidekiq.freeze!
       @thread = safe_thread("heartbeat", &method(:start_heartbeat)) if async_beat
       @poller.start
       @managers.each(&:start)
@@ -68,6 +68,7 @@ module Sidekiq
       stoppers.each(&:join)
 
       clear_heartbeat
+      fire_event(:exit, reverse: true)
     end
 
     def stopping?
@@ -81,7 +82,7 @@ module Sidekiq
       ❤
     end
 
-    private unless $TESTING
+    private
 
     BEAT_PAUSE = 10
 
@@ -141,6 +142,12 @@ module Sidekiq
       key = identity
       fails = procd = 0
 
+      idle_timeout = config[:redis_idle_timeout]
+      if idle_timeout
+        config.capsules.each_value { |cap| cap.local_redis_pool.reap(idle_seconds: idle_timeout, &:close) }
+        config.local_redis_pool.reap(idle_seconds: idle_timeout, &:close)
+      end
+
       begin
         flush_stats
 
@@ -169,6 +176,7 @@ module Sidekiq
             transaction.sadd("processes", [key])
             transaction.exists(key)
             transaction.hset(key, "info", to_json,
+              "concurrency", @config.total_concurrency,
               "busy", curstate.size,
               "beat", Time.now.to_f,
               "rtt_us", rtt,
@@ -213,11 +221,11 @@ module Sidekiq
       # Log a warning if it's a disaster.
       if RTT_READINGS.all? { |x| x > RTT_WARNING_LEVEL }
         logger.warn <<~EOM
-          Your Redis network connection is performing extremely poorly.
+          Your Redis network connection appears to be performing poorly.
           Last RTT readings were #{RTT_READINGS.buffer.inspect}, ideally these should be < 1000.
-          Ensure Redis is running in the same AZ or datacenter as Sidekiq.
-          If these values are close to 100,000, that means your Sidekiq process may be
-          CPU-saturated; reduce your concurrency and/or see https://github.com/sidekiq/sidekiq/discussions/5039
+          Ensure Redis is running in the same AZ or datacenter as Sidekiq and that
+          your Sidekiq process is not CPU-saturated; reduce your concurrency and/or
+          see https://github.com/sidekiq/sidekiq/discussions/5039
         EOM
         RTT_READINGS.reset
       end
@@ -227,7 +235,7 @@ module Sidekiq
     MEMORY_GRABBER = case RUBY_PLATFORM
     when /linux/
       ->(pid) {
-        IO.readlines("/proc/#{$$}/status").each do |line|
+        IO.readlines("/proc/#{pid}/status").each do |line|
           next unless line.start_with?("VmRSS:")
           break line.split[1].to_i
         end
@@ -250,18 +258,20 @@ module Sidekiq
         "started_at" => Time.now.to_f,
         "pid" => ::Process.pid,
         "tag" => @config[:tag] || "",
-        "concurrency" => @config.total_concurrency,
+        "capsules" => @config.capsules.each_with_object({}) { |(name, cap), memo|
+          memo[name] = cap.to_h
+        },
+        #####
+        # TODO deprecated, remove in 9.0
+        # This data is now found in the `capsules` element above
         "queues" => @config.capsules.values.flat_map { |cap| cap.queues }.uniq,
-        "weights" => to_weights,
+        "weights" => @config.capsules.values.map(&:weights),
+        #####
         "labels" => @config[:labels].to_a,
         "identity" => identity,
         "version" => Sidekiq::VERSION,
         "embedded" => @embedded
       }
-    end
-
-    def to_weights
-      @config.capsules.values.map(&:weights)
     end
 
     def to_json

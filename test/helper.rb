@@ -3,15 +3,12 @@
 require "bundler/setup"
 Bundler.require(:default, :test)
 
+require "minitest/mock"
 require "minitest/pride"
-require "maxitest/autorun"
-require "maxitest/threads"
+require "minitest/autorun"
 
 $TESTING = true
-# disable minitest/parallel threads
-ENV["MT_CPU"] = "0"
-ENV["N"] = "0"
-# Disable any stupid backtrace cleansers
+# Disable any backtrace cleansers
 ENV["BACKTRACE"] = "1"
 
 if ENV["COVERAGE"]
@@ -24,7 +21,7 @@ if ENV["COVERAGE"]
   end
 end
 
-ENV["REDIS_URL"] ||= "redis://localhost/15"
+ENV["REDIS_URL"] ||= "redis://localhost:6379/0"
 NULL_LOGGER = Logger.new(IO::NULL)
 
 def reset!
@@ -34,7 +31,9 @@ def reset!
     existing_pool&.shutdown(&:close)
   end
 
-  RedisClient.new(url: ENV["REDIS_URL"]).call("flushall")
+  c = RedisClient.new(url: ENV["REDIS_URL"])
+  c.call("flushdb")
+  c.close
   cfg = Sidekiq::Config.new
   cfg[:backtrace_cleaner] = Sidekiq::Config::DEFAULTS[:backtrace_cleaner]
   cfg.logger = NULL_LOGGER
@@ -49,6 +48,7 @@ def capture_logging(cfg, lvl = Logger::INFO)
     out = StringIO.new
     logger = ::Logger.new(out)
     logger.level = lvl
+    logger.formatter = Sidekiq::Logger::Formatters::Pretty.new
     cfg.logger = logger
     yield logger
     out.string
@@ -57,13 +57,27 @@ def capture_logging(cfg, lvl = Logger::INFO)
   end
 end
 
-Signal.trap("TTIN") do
-  Thread.list.each do |thread|
-    puts "Thread TID-#{(thread.object_id ^ ::Process.pid).to_s(36)} #{thread.name}"
-    if thread.backtrace
-      puts thread.backtrace.join("\n")
-    else
-      puts "<no backtrace available>"
+begin
+  Signal.trap("INFO") do
+    Thread.list.each do |thread|
+      puts "Thread TID-#{(thread.object_id ^ ::Process.pid).to_s(36)} #{thread.name}"
+      if thread.backtrace
+        puts thread.backtrace.join("\n")
+      else
+        puts "<no backtrace available>"
+      end
     end
   end
+rescue ArgumentError
+  # INFO signal not supported in CI
 end
+
+require "active_job"
+
+# Require adapter class before setting the adapter.
+require "sidekiq/rails"
+
+# need to force this since we aren't booting a Rails app
+ActiveJob::Base.queue_adapter = :sidekiq
+ActiveJob::Base.logger = nil
+ActiveJob::Base.send(:include, ::Sidekiq::Job::Options) unless ActiveJob::Base.respond_to?(:sidekiq_options)

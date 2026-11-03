@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "sidekiq/processor"
-require "set"
 
 module Sidekiq
   ##
@@ -70,12 +69,13 @@ module Sidekiq
     def processor_result(processor, reason = nil)
       @plock.synchronize do
         @workers.delete(processor)
-        unless @done
+        if !@done && @count > @workers.size
           p = Processor.new(@config, &method(:processor_result))
           @workers << p
           p.start
         end
       end
+      nil
     end
 
     def stopped?

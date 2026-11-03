@@ -11,22 +11,10 @@ describe Sidekiq::RedisConnection do
       @config.default_capsule.concurrency = 12
     end
 
-    def client_for(redis)
-      redis.instance_variable_get(:@client)
-    end
-
-    def config_for(redis)
-      redis.config
-    end
-
-    def client_class
-      Sidekiq::RedisClientAdapter::CompatClient
-    end
-
     it "creates a pooled redis connection" do
       pool = Sidekiq::RedisConnection.create
       assert_equal 5, pool.size
-      assert_equal client_class, pool.checkout.class
+      assert_equal(Sidekiq::RedisClientAdapter::CompatClient, pool.with { |c| c.class })
     end
 
     it "crashes on RESP2" do
@@ -79,23 +67,18 @@ describe Sidekiq::RedisConnection do
 
     it "disables client setname with nil id" do
       pool = Sidekiq::RedisConnection.create(id: nil)
-      assert_equal client_class, pool.checkout.class
-      client = client_for(pool.checkout)
-      assert_nil client.id
+      assert_nil(pool.with { |client| client.id })
     end
 
     describe "network_timeout" do
       it "sets a custom network_timeout if specified" do
         pool = Sidekiq::RedisConnection.create(network_timeout: 8)
-        redis = pool.checkout
-
-        assert_equal 8, client_for(redis).read_timeout
+        assert_equal 8, pool.with { |r| r.read_timeout }
       end
 
       it "uses the default network_timeout if none specified" do
         pool = Sidekiq::RedisConnection.create
-        redis = pool.checkout
-        assert_equal 1.0, client_for(redis).read_timeout
+        assert_equal 3.0, pool.with { |r| r.read_timeout }
       end
     end
 
@@ -111,15 +94,13 @@ describe Sidekiq::RedisConnection do
     describe "socket path" do
       it "uses a given :path" do
         pool = Sidekiq::RedisConnection.create(path: "/tmp/redis.sock")
-        config = config_for(pool.checkout)
-        assert_equal "/tmp/redis.sock", config.path
+        assert_equal "/tmp/redis.sock", pool.with { |c| c.config.path }
       end
 
       it "uses a given :path and :db" do
         pool = Sidekiq::RedisConnection.create(path: "/tmp/redis.sock", db: 8)
-        config = config_for(pool.checkout)
-        assert_equal "/tmp/redis.sock", config.path
-        assert_equal 8, config.db
+        assert_equal "/tmp/redis.sock", pool.with { |c| c.config.path }
+        assert_equal 8, pool.with { |c| c.config.db }
       end
     end
 
@@ -137,12 +118,15 @@ describe Sidekiq::RedisConnection do
       end
     end
 
-    describe "driver" do
-      it "uses ruby driver by default" do
+    describe "driver_info" do
+      it "identifies sidekiq by default" do
         pool = Sidekiq::RedisConnection.create
-        config = config_for(pool.checkout)
+        assert_equal "sidekiq_v#{Sidekiq::VERSION}", pool.with { |c| c.config.driver_info }
+      end
 
-        assert_equal RedisClient::RubyConnection, config.driver
+      it "preserves a user-provided driver_info" do
+        pool = Sidekiq::RedisConnection.create(driver_info: "custom-app-1.2.3")
+        assert_equal "custom-app-1.2.3", pool.with { |c| c.config.driver_info }
       end
     end
 
@@ -166,17 +150,45 @@ describe Sidekiq::RedisConnection do
 
         refute_includes(options.inspect, "REDACTED")
         refute_includes(output, "secret")
-        assert_includes(output, ':host=>"host1", :port=>26379, :password=>"REDACTED"')
-        assert_includes(output, ':host=>"host2", :port=>26379, :password=>"REDACTED"')
-        assert_includes(output, ':host=>"host3", :port=>26379, :password=>"REDACTED"')
-        assert_includes(output, ':password=>"REDACTED"')
+        assert_includes(output, '"REDACTED"')
+      end
+
+      it "redacts the password in a URL" do
+        output = capture_logging(@config) do |logger|
+          Sidekiq::RedisConnection.create(url: "redis://:secret@localhost:6379/0", logger: logger)
+        end
+
+        refute_includes(output, "secret")
+        assert_includes(output, "redis://:REDACTED@localhost:6379/0")
+      end
+
+      it "redacts a URL which can't be parsed" do
+        output = capture_logging(@config) do |logger|
+          Sidekiq::RedisConnection.create(url: "redis://:s3cr^t@localhost:6379/0", logger: logger)
+        rescue URI::InvalidURIError
+          # redis-client rejects the URL after the options are logged
+        end
+
+        refute_includes(output, "s3cr")
+        assert_includes(output, "REDACTED")
+      end
+
+      it "redacts a sentinel URL which can't be parsed" do
+        options = {
+          url: "redis://mymaster",
+          sentinels: ["redis://:s3cr^t@host1:26379", "redis://:secret@host2:26379"]
+        }
+        scrubbed = Sidekiq::RedisConnection.send(:scrub, options)
+
+        assert_equal ["REDACTED", "redis://:REDACTED@host2:26379"], scrubbed[:sentinels]
+        assert_equal ["redis://:s3cr^t@host1:26379", "redis://:secret@host2:26379"], options[:sentinels]
       end
 
       it "prunes SSL parameters from the logging" do
         output = capture_logging(@config) do |logger|
           options = {
             ssl_params: {
-              cert_store: OpenSSL::X509::Store.new
+              cert_store: []
             },
             logger: logger
           }
@@ -253,6 +265,22 @@ describe Sidekiq::RedisConnection do
       it "sets connection URI to custom uri" do
         with_env_var "REDIS_URL", "redis://redis-uri:6379/0"
       end
+    end
+  end
+end
+
+describe Sidekiq::RedisClientAdapter do
+  before do
+    @config = reset!
+  end
+
+  # Commands not in USED_COMMANDS are routed through method_missing, which must
+  # forward a result-transformation block to redis-client. Regression guard: the
+  # block was being splatted as a positional argument instead of forwarded.
+  it "forwards a block through method_missing" do
+    @config.redis do |conn|
+      result = conn.echo("hello") { |reply| reply.upcase }
+      assert_equal "HELLO", result
     end
   end
 end

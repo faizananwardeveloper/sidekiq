@@ -6,9 +6,29 @@ require "active_support/core_ext/numeric/time"
 
 class MySetJob
   include Sidekiq::Job
+
   queue_as :foo
   sidekiq_options "retry" => 12
   def perform
+  end
+end
+
+class Stopper
+  attr_accessor :_stopping
+  def stopping?
+    @_stopping
+  end
+end
+
+class ForeverJob
+  include Sidekiq::Job
+
+  def perform
+    count = 0
+    until count > 1000 && interrupted?
+      count += 1
+    end
+    count
   end
 end
 
@@ -110,6 +130,37 @@ describe Sidekiq::Job do
       assert_equal "xyz", job["bar"]
     end
 
+    it "schedules jobs when wait is set in a chained call" do
+      q = Sidekiq::ScheduledSet.new
+      q.clear
+      assert_equal 0, q.size
+
+      assert MySetJob.set(queue: :bar).set(wait: 1.hour).perform_async(1)
+
+      assert_equal 1, q.size
+      job = q.first
+      assert_equal "bar", job["queue"]
+      assert_equal [1], job["args"]
+    end
+
+    it "can detect when stopping" do
+      refute MySetJob.new.interrupted?
+    end
+
+    it "stops on command" do
+      stop = Stopper.new
+      stop._stopping = false
+      t = Thread.new do
+        job = ForeverJob.new
+        job._context = stop
+        job.perform
+      end
+      Thread.pass
+      stop._stopping = true
+      result = t.value
+      assert_operator 1000, :<=, result
+    end
+
     it "works with .perform_bulk" do
       q = Sidekiq::Queue.new("bar")
       assert_equal 0, q.size
@@ -144,6 +195,50 @@ describe Sidekiq::Job do
       @config.client_middleware.add MyCustomMiddleware, "1-client", $my_recorder
       MyCustomJob.perform_inline($my_recorder)
       assert_equal $my_recorder.flatten, %w[1-client-before 1-client-after 1-server-before work_performed 1-server-after]
+    end
+
+    it "raises an error when using a symbol as an argument" do
+      error = assert_raises ArgumentError do
+        MySetJob.perform_inline(:symbol)
+      end
+      assert_match(/but :symbol is a Symbol/, error.message)
+    end
+  end
+
+  describe "#perform_in scheduling normalization" do
+    before { @config = reset! }
+
+    it "schedules a job into the future for a positive interval" do
+      MySetJob.perform_in(60)
+      assert_equal 1, Sidekiq::ScheduledSet.new.size
+      assert_equal 0, Sidekiq::Queue.new("foo").size
+    end
+
+    it "treats a number >= 1_000_000_000 as an absolute epoch timestamp" do
+      future_epoch = 2_000_000_000
+      MySetJob.perform_at(future_epoch)
+      entry = Sidekiq::ScheduledSet.new.first
+      refute_nil entry
+      assert_in_delta future_epoch, entry.at.to_f, 0.001
+    end
+
+    it "enqueues immediately instead of scheduling when the interval is in the past" do
+      MySetJob.perform_in(-60)
+      assert_equal 0, Sidekiq::ScheduledSet.new.size
+      assert_equal 1, Sidekiq::Queue.new("foo").size
+    end
+  end
+
+  describe ".delay / .delay_for / .delay_until" do
+    it "raise ArgumentError redirecting to perform_async / perform_in / perform_at" do
+      err = assert_raises(ArgumentError) { MySetJob.delay }
+      assert_match(/call \.perform_async/, err.message)
+
+      err = assert_raises(ArgumentError) { MySetJob.delay_for(10) }
+      assert_match(/call \.perform_in/, err.message)
+
+      err = assert_raises(ArgumentError) { MySetJob.delay_until(Time.now + 10) }
+      assert_match(/call \.perform_at/, err.message)
     end
   end
 end

@@ -1,6 +1,7 @@
+# frozen_string_literal: true
+
 require_relative "helper"
 require "sidekiq/job_retry"
-require "sidekiq/capsule"
 
 class NewJob
   include Sidekiq::Job
@@ -76,7 +77,7 @@ describe "sidekiq_retries_exhausted" do
   end
 
   def handler
-    @handler ||= Sidekiq::JobRetry.new(@config.default_capsule)
+    @handler ||= Sidekiq::JobRetry.new(@config)
   end
 
   def job(options = {})
@@ -185,7 +186,7 @@ describe "sidekiq_retries_exhausted" do
     assert_equal 0, Sidekiq::DeadSet.new.size
   end
 
-  it "does not allow disabling global failure handlers when disabling dead set" do
+  it "does not disable death handlers when disabling dead set" do
     exhausted_job = nil
     exhausted_exception = nil
     @config.death_handlers.clear
@@ -200,10 +201,11 @@ describe "sidekiq_retries_exhausted" do
     end
 
     assert exhausted_job
+    assert exhausted_job["discarded_at"]
     assert exhausted_exception
   end
 
-  it "supports discard option to disable global failure handlers and dead set" do
+  it ":discard still calls death handlers" do
     discard_job = DiscardJob.new
 
     exhausted_job = nil
@@ -221,8 +223,9 @@ describe "sidekiq_retries_exhausted" do
 
     assert DiscardJob.exhausted_called
     assert_equal 0, Sidekiq::DeadSet.new.size
-    assert_nil exhausted_job
-    assert_nil exhausted_exception
+    refute_nil exhausted_job
+    assert exhausted_job["discarded_at"]
+    refute_nil exhausted_exception
   end
 
   it "supports wrapped jobs" do

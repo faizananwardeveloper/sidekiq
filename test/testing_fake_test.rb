@@ -5,6 +5,7 @@ class PerformError < RuntimeError; end
 
 class DirectJob
   include Sidekiq::Job
+
   def perform(a, b)
     a + b
   end
@@ -12,6 +13,7 @@ end
 
 class EnqueuedJob
   include Sidekiq::Job
+
   def perform(a, b)
     a + b
   end
@@ -19,6 +21,7 @@ end
 
 class StoredJob
   include Sidekiq::Job
+
   def perform(error)
     raise PerformError if error
   end
@@ -26,6 +29,7 @@ end
 
 class SpecificJidJob
   include Sidekiq::Job
+
   sidekiq_class_attribute :count
   self.count = 0
   def perform(worker_jid)
@@ -36,6 +40,7 @@ end
 
 class FirstJob
   include Sidekiq::Job
+
   sidekiq_class_attribute :count
   self.count = 0
   def perform
@@ -45,6 +50,7 @@ end
 
 class SecondJob
   include Sidekiq::Job
+
   sidekiq_class_attribute :count
   self.count = 0
   def perform
@@ -54,6 +60,7 @@ end
 
 class ThirdJob
   include Sidekiq::Job
+
   sidekiq_class_attribute :count
   def perform
     FirstJob.perform_async
@@ -63,6 +70,7 @@ end
 
 class QueueJob
   include Sidekiq::Job
+
   def perform(a, b)
     a + b
   end
@@ -70,6 +78,7 @@ end
 
 class AltQueueJob
   include Sidekiq::Job
+
   sidekiq_options queue: :alt
   def perform(a, b)
     a + b
@@ -93,7 +102,7 @@ describe "Sidekiq::Testing.fake" do
   it "stubs the async call" do
     assert_equal 0, DirectJob.jobs.size
     assert DirectJob.perform_async(1, 2)
-    assert_in_delta Time.now.to_f, DirectJob.jobs.last["enqueued_at"], 0.1
+    assert_in_delta ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond), DirectJob.jobs.last["enqueued_at"], 10
     assert_equal 1, DirectJob.jobs.size
     assert DirectJob.perform_in(10, 1, 2)
     refute DirectJob.jobs.last["enqueued_at"]

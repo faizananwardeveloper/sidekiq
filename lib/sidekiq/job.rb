@@ -69,7 +69,11 @@ module Sidekiq
         # In practice, any option is allowed.  This is the main mechanism to configure the
         # options for a specific job.
         def sidekiq_options(opts = {})
-          opts = opts.transform_keys(&:to_s) # stringify
+          # stringify 2 levels of keys
+          opts = opts.to_h do |k, v|
+            [k.to_s, (Hash === v) ? v.transform_keys(&:to_s) : v]
+          end
+
           self.sidekiq_options_hash = get_sidekiq_options.merge(opts)
         end
 
@@ -155,6 +159,9 @@ module Sidekiq
 
     attr_accessor :jid
 
+    # This attribute is implementation-specific and not a public API
+    attr_accessor :_context
+
     def self.included(base)
       raise ArgumentError, "Sidekiq::Job cannot be included in an ActiveJob: #{base.name}" if base.ancestors.any? { |c| c.name == "ActiveJob::Base" }
 
@@ -164,6 +171,10 @@ module Sidekiq
 
     def logger
       Sidekiq.logger
+    end
+
+    def interrupted?
+      @_context&.stopping?
     end
 
     # This helper class encapsulates the set options for `set`, e.g.
@@ -185,7 +196,7 @@ module Sidekiq
 
       def set(options)
         hash = options.transform_keys(&:to_s)
-        interval = hash.delete("wait_until") || @opts.delete("wait")
+        interval = hash.delete("wait_until") || hash.delete("wait")
         @opts.merge!(hash)
         at(interval) if interval
         self
@@ -215,6 +226,8 @@ module Sidekiq
         end
         return nil unless result
 
+        verify_json(item)
+
         # round-trip the payload via JSON
         msg = Sidekiq.load_json(Sidekiq.dump_json(item))
 
@@ -237,9 +250,9 @@ module Sidekiq
       end
       alias_method :perform_sync, :perform_inline
 
-      def perform_bulk(args, batch_size: 1_000)
+      def perform_bulk(args, **options)
         client = @klass.build_client
-        client.push_bulk(@opts.merge("class" => @klass, "args" => args, :batch_size => batch_size))
+        client.push_bulk(@opts.merge({"class" => @klass, "args" => args}, options))
       end
 
       # +interval+ must be a timestamp, numeric or something that acts
@@ -300,6 +313,11 @@ module Sidekiq
       #
       # +items+ must be an Array of Arrays.
       #
+      # The +:at+ option schedules the jobs for future execution. It accepts
+      # either a single Numeric timestamp (or seconds-from-now) applied to every
+      # job, or an Array of Numeric values with the same size as +items+ to
+      # schedule each job at its corresponding time.
+      #
       # For finer-grained control, use `Sidekiq::Client.push_bulk` directly.
       #
       # Example (3 Redis round trips):
@@ -311,6 +329,14 @@ module Sidekiq
       # Would instead become (1 Redis round trip):
       #
       #     SomeJob.perform_bulk([[1], [2], [3]])
+      #
+      # Scheduling every job 60 seconds from now (single Numeric +:at+):
+      #
+      #     SomeJob.perform_bulk([[1], [2], [3]], at: 60)
+      #
+      # Scheduling each job at its own time (Array +:at+):
+      #
+      #     SomeJob.perform_bulk([[1], [2]], at: [Time.now.to_f + 30, Time.now.to_f + 60])
       #
       def perform_bulk(*args, **kwargs)
         Setter.new(self, {}).perform_bulk(*args, **kwargs)
@@ -366,7 +392,7 @@ module Sidekiq
 
       def build_client # :nodoc:
         pool = Thread.current[:sidekiq_redis_pool] || get_sidekiq_options["pool"] || Sidekiq.default_configuration.redis_pool
-        client_class = get_sidekiq_options["client_class"] || Sidekiq::Client
+        client_class = Thread.current[:sidekiq_client_class] || get_sidekiq_options["client_class"] || Sidekiq::Client
         client_class.new(pool: pool)
       end
     end
